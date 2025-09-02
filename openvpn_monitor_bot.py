@@ -4,6 +4,7 @@ import subprocess
 import time
 from datetime import date, datetime, timedelta
 import glob
+import json
 from OpenSSL import crypto
 import pytz
 
@@ -16,10 +17,6 @@ from telegram.ext import (
 
 from config import TOKEN, ADMIN_ID
 
-# --- Версия и URL для обновления (добавлено) ---
-BOT_VERSION = "2025-09-02"
-UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
-
 # --- Константы путей ---
 KEYS_DIR = "/root"
 OPENVPN_DIR = "/etc/openvpn"
@@ -29,16 +26,26 @@ BACKUP_DIR = "/root"
 STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
 
+# Файл-флаг (сейчас не используется активно)
 NOTIFY_FILE = "/root/monitor_bot/notify.flag"
 
 TM_TZ = pytz.timezone("Asia/Ashgabat")
 MGMT_SOCKET = "/var/run/openvpn.sock"
 
 # --- Порог тревоги и антиспам ---
-MIN_ONLINE_ALERT = 15
-ALERT_INTERVAL_SEC = 300
-last_alert_time = 0
+MIN_ONLINE_ALERT = 15          # Если онлайн клиентов меньше этого числа — предупреждение
+ALERT_INTERVAL_SEC = 300       # Не слать тревогу чаще, чем раз в 5 минут
+last_alert_time = 0            # Время последней тревоги (epoch)
+
+# Для отслеживания подключений/отключений (не используется для трафика)
 clients_last_online = set()
+
+# --- УЧЁТ ТРАФИКА ---
+TRAFFIC_DB_PATH = "/root/monitor_bot/traffic_usage.json"
+traffic_usage = {}              # client_name -> total_bytes (накопительно)
+_last_session_state = {}        # client_name -> {'connected_since': str, 'total': int} baseline текущей сессии
+_last_traffic_save_time = 0
+TRAFFIC_SAVE_INTERVAL = 60      # сек между автосохранениями JSON
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 
@@ -163,6 +170,14 @@ def bytes_to_mb(b):
     except:
         return "0 MB"
 
+def format_tm_time(dt_str):
+    try:
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        dt = pytz.utc.localize(dt).astimezone(TM_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return dt_str
+
 def split_message(text, max_length=4000):
     lines = text.split('\n')
     messages = []
@@ -176,14 +191,6 @@ def split_message(text, max_length=4000):
     if current:
         messages.append(current)
     return messages
-
-def format_tm_time(dt_str):
-    try:
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        dt = pytz.utc.localize(dt).astimezone(TM_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return dt_str
 
 def get_ovpn_files():
     return [f for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
@@ -218,6 +225,90 @@ def kill_openvpn_session(client_name):
             print(f"[kill_openvpn_session] Ошибка: {e}")
     return False
 
+# ================== ТРАФИК (учёт) ==================
+
+def load_traffic_db():
+    global traffic_usage
+    try:
+        if os.path.exists(TRAFFIC_DB_PATH):
+            with open(TRAFFIC_DB_PATH, "r") as f:
+                traffic_usage = json.load(f)
+    except Exception as e:
+        print(f"[traffic] load error: {e}")
+        traffic_usage = {}
+
+def save_traffic_db(force=False):
+    global _last_traffic_save_time
+    now = time.time()
+    if not force and now - _last_traffic_save_time < TRAFFIC_SAVE_INTERVAL:
+        return
+    try:
+        tmp = TRAFFIC_DB_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(traffic_usage, f)
+        os.replace(tmp, TRAFFIC_DB_PATH)
+        _last_traffic_save_time = now
+    except Exception as e:
+        print(f"[traffic] save error: {e}")
+
+def format_bytes_gb(b):
+    try:
+        return f"{int(b)/1024/1024/1024:.3f} GB"
+    except:
+        return "0 GB"
+
+def build_traffic_report():
+    if not traffic_usage:
+        return "<b>Трафик:</b>\nПока нет накопленных данных."
+    items = sorted(traffic_usage.items(), key=lambda x: x[1], reverse=True)
+    lines = ["<b>Использование трафика (суммарно RX+TX):</b>"]
+    for name, total in items:
+        lines.append(f"• <b>{name}</b>: {format_bytes_gb(total)}")
+    return "\n".join(lines)
+
+def update_traffic_from_status(clients):
+    """
+    Обновляет cumulative usage.
+    clients: список из parse_openvpn_status (только онлайн строки CLIENT LIST)
+    Не сбрасываем при переподключении, база суммируется по дельтам.
+    """
+    global traffic_usage, _last_session_state
+    changed = False
+    for c in clients:
+        name = c['name']
+        try:
+            recv = int(c.get('bytes_recv', 0))
+            sent = int(c.get('bytes_sent', 0))
+        except:
+            continue
+        session_total = recv + sent
+        connected_since = c.get('connected_since', '')
+        prev = _last_session_state.get(name)
+
+        if name not in traffic_usage:
+            traffic_usage[name] = 0
+
+        if prev is None or prev['connected_since'] != connected_since:
+            # Новая сессия: фиксируем baseline, накопленное не трогаем
+            _last_session_state[name] = {
+                'connected_since': connected_since,
+                'total': session_total
+            }
+            continue
+
+        last_total = prev['total']
+        delta = session_total - last_total
+        if delta > 0:
+            traffic_usage[name] += delta
+            prev['total'] = session_total
+            changed = True
+        else:
+            # delta <= 0 (редко) — просто обновим baseline чтобы не застревать
+            prev['total'] = session_total
+
+    if changed:
+        save_traffic_db()
+
 # ================== UI (Клавиатуры / HELP) ==================
 
 def get_main_keyboard():
@@ -225,6 +316,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
+        [InlineKeyboardButton("📶 Трафик", callback_data='traffic')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
          InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
         [InlineKeyboardButton("✅ Вкл.клиента", callback_data='enable'),
@@ -236,8 +328,6 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
-        # Новая кнопка с командой обновления
-        [InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -266,44 +356,17 @@ def get_confirm_delete_keyboard(fname):
 
 HELP_TEXT = """
 <b>📖 Помощь по VPN Боту:</b>
-...
+
+Функции:
+• Статистика / онлайн / лог
+• Создание, обновление, удаление ключей
+• Включение / отключение клиента
+• Бэкап и восстановление
+• Тревога по количеству онлайн
+• Накопительный учёт трафика (/traffic или кнопка 📶 Трафик)
+
+Все команды только для администратора.
 """
-
-# ================== UPDATE COMMAND FEATURE ==================
-
-def build_update_commands():
-    short_cmd = f"curl -L -o /root/monitor_bot/openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && systemctl restart vpn_bot.service"
-    safe_cmd = (
-        "cd /root/monitor_bot && "
-        "cp openvpn_monitor_bot.py openvpn_monitor_bot.py.bak_$(date +%Y%m%d_%H%M%S) && "
-        f"curl -L -o openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && "
-        "python3 -m py_compile openvpn_monitor_bot.py && "
-        "systemctl restart vpn_bot.service"
-    )
-    return short_cmd, safe_cmd
-
-async def show_update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    short_cmd, safe_cmd = build_update_commands()
-    text = (
-        f"<b>Команда обновления бота</b> (версия: <code>{BOT_VERSION}</code>)\n\n"
-        "Простая:\n<code>" + short_cmd + "</code>\n\n"
-        "С бэкапом и проверкой:\n<code>" + safe_cmd + "</code>\n\n"
-        "Откат (пример):\n<code>cp /root/monitor_bot/openvpn_monitor_bot.py.bak_YYYYMMDD_HHMMSS "
-        " /root/monitor_bot/openvpn_monitor_bot.py && systemctl restart vpn_bot.service</code>"
-    )
-    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
-
-async def send_update_cmd_via_button(chat_id: int, bot):
-    short_cmd, safe_cmd = build_update_commands()
-    text = (
-        f"<b>Обновление бота</b>\nТекущая версия: <code>{BOT_VERSION}</code>\n\n"
-        "Простая:\n<code>" + short_cmd + "</code>\n\n"
-        "Расширенная (с бэкапом):\n<code>" + safe_cmd + "</code>"
-    )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 # ================== OVPN ГЕНЕРАЦИЯ / КЛЮЧИ ==================
 
@@ -361,8 +424,6 @@ def generate_ovpn_for_client(
     with open(ovpn_file, "w") as f:
         f.write(ovpn_content)
     return ovpn_file
-
-# === (остальные хендлеры создания/обновления/удаления ключей без изменений) ===
 
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('await_key_name'):
@@ -523,7 +584,7 @@ async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=os.path.basename(backup_file)
         )
 
-# ================== УВЕДОМЛЕНИЯ ==================
+# ================== УВЕДОМЛЕНИЯ (флаг) ==================
 
 def is_notify_enabled():
     return os.path.exists(NOTIFY_FILE)
@@ -544,7 +605,7 @@ async def notify_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not enabled:
         await query.edit_message_text("✅ Уведомления о новых подключениях ВКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
     else:
-        await query.edit_message_text("🚫 Уведомления о новых подключениях ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+        await query.edit_message_text("🚫 Уведомления ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
 
 # Главный мониторинг
 async def check_new_connections(app: Application):
@@ -553,6 +614,10 @@ async def check_new_connections(app: Application):
     while True:
         try:
             clients, online_names, tunnel_ips = parse_openvpn_status()
+
+            # --- обновление трафика ---
+            update_traffic_from_status(clients)
+
             online_count = len(online_names)
             total_keys = len(get_ovpn_files())
             now = time.time()
@@ -636,20 +701,20 @@ async def disable_client_handler(update: Update, context: ContextTypes.DEFAULT_T
     block_client_ccd(cname)
     killed = kill_openvpn_session(cname)
     msg = f"Клиент <b>{cname}</b> отключён."
-    msg += "\nСессия завершена." if killed else "\nАктивная сессия (если была) завершится при переподключении."
+    msg += "\nСессия завершена." if killed else "\nАктивная сессия завершится при переподключении."
     await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    await update.message.reply_text(f"Добро пожаловать в VPN бот!\nВерсия: <code>{BOT_VERSION}</code>", parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    await update.message.reply_text(HELP_TEXT.replace("...", f"(версия {BOT_VERSION})"), parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -682,7 +747,6 @@ async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступ запрещён.")
         return
     clients, online_names, tunnel_ips = parse_openvpn_status()
-    # Формируем только онлайн
     res = []
     for c in clients:
         if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
@@ -828,7 +892,32 @@ async def restore_cancel_handler(update: Update, context: ContextTypes.DEFAULT_T
     await update.callback_query.answer("Отменено.")
     await update.callback_query.edit_message_text("Восстановление отменено.", reply_markup=get_main_keyboard())
 
+# ====== TRAFFIC HANDLERS ======
+
+async def traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    save_traffic_db(force=True)
+    report = build_traffic_report()
+    await update.message.reply_text(report, parse_mode="HTML", reply_markup=get_main_keyboard())
+
 # ================== BUTTON HANDLER ==================
+
+def format_online_clients(clients, online_names, tunnel_ips):
+    res = []
+    for c in clients:
+        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
+            tunnel_ip = tunnel_ips.get(c['name'], 'нет')
+            res.append(
+                f"🟢 <b>{c['name']}</b>\n"
+                f"🌐 <code>{c.get('ip','нет')}</code>\n"
+                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
+                f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
+                f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
+                + "-"*15
+            )
+    return "<b>Онлайн клиенты:</b>\n\n" + ("\n".join(res) if res else "Нет активных клиентов.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -841,10 +930,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'refresh':
         msg = format_clients_by_certs()
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+
     elif data == 'renew_key':
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
         await renew_key_select_handler(update, context)
+
     elif data == 'stats':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         ipp_map = read_ipp_file("/etc/openvpn/ipp.txt")
@@ -853,6 +944,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for msg in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+
     elif data == 'online':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         text = format_online_clients(clients, online_names, tunnel_ips)
@@ -860,25 +952,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for m in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
+
+    elif data == 'traffic':
+        save_traffic_db(force=True)
+        report = build_traffic_report()
+        await query.edit_message_text(report, parse_mode="HTML", reply_markup=get_main_keyboard())
+
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
+
     elif data == 'help':
-        msgs = split_message(HELP_TEXT.replace("...", f"(версия {BOT_VERSION})"))
+        msgs = split_message(HELP_TEXT)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for m in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
+
     elif data == 'restore_confirm':
         await restore_confirm_handler(update, context)
     elif data == 'restore_cancel':
         await restore_cancel_handler(update, context)
+
     elif data == 'send_keys':
         keys = get_ovpn_files()
         await query.edit_message_text("Выберите ключ:", reply_markup=get_keys_keyboard(keys))
+
     elif data.startswith('key_'):
         idx = int(data.split('_')[1]) - 1
         keys = get_ovpn_files()
         if 0 <= idx < len(keys):
             await send_ovpn_file(update, context, keys[idx])
+
     elif data == 'delete_key':
         await delete_key_request(update, context)
     elif data.startswith('delete_'):
@@ -887,24 +990,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_key_confirm_handler(update, context)
     elif data == 'cancel_delete':
         await delete_key_cancel_handler(update, context)
+
     elif data == 'create_key':
         await ask_key_name(update, context)
+
     elif data == 'backup':
         await send_backup(update, context)
+
     elif data == 'restore':
         await restore_request(update, context)
+
     elif data == 'home':
         await query.edit_message_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
+
     elif data == 'enable':
         await enable_request(update, context)
     elif data.startswith('enable_'):
         await enable_client_handler(update, context)
+
     elif data == 'disable':
         await disable_request(update, context)
     elif data.startswith('disable_'):
         await disable_client_handler(update, context)
+
     elif data == 'log':
         await log_request(update, context)
+
     elif data == 'block_alert':
         await query.edit_message_text(
             "Тревога активна в фоне.\n"
@@ -912,8 +1023,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Изменить можно в коде.",
             reply_markup=get_main_keyboard()
         )
-    elif data == 'update_info':
-        await send_update_cmd_via_button(update.effective_chat.id, context.bot)
     else:
         await query.edit_message_text("Команда не реализована.", reply_markup=get_main_keyboard())
 
@@ -922,15 +1031,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    # Загрузка БД трафика
+    load_traffic_db()
+
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
-    app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))   # новая команда
+    app.add_handler(CommandHandler("traffic", traffic_command))
 
+    # Сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
 
+    # Callback
     app.add_handler(CallbackQueryHandler(button_handler))
 
     import asyncio
