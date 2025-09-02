@@ -311,7 +311,7 @@ def format_bytes_gb(b):
     try:
         return f"{int(b)/1024/1024/1024:.2f} GB"
     except:
-        return "0 GB"
+        return "0.00 GB"
 
 def build_traffic_report():
     if not traffic_usage:
