@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 from datetime import date, datetime, timedelta
+from typing import Optional, Tuple, List
 import glob
 import json
 import re
@@ -398,12 +399,12 @@ def clear_traffic_stats():
 # ================== REMOTE (массовое обновление remote) ==================
 ### REMOTE UPDATE START
 
-def parse_new_remote(input_str: str):
+def parse_new_remote(input_str: str) -> Tuple[Optional[str], Optional[int]]:
     """
     Принимает строку вида:
-      - host
-      - host:port
-    Возвращает (host, port_or_None). Порт валидируем как int 1..65535.
+      host
+      host:port
+    Возвращает (host, port_or_None).
     """
     s = input_str.strip()
     if not s:
@@ -416,16 +417,15 @@ def parse_new_remote(input_str: str):
             if 1 <= port <= 65535:
                 return host, port
         except:
-            return host, None  # если порт невалидный — вернём только host
+            return host, None
         return host, None
     return s, None
 
-REMOTE_LINE_REGEX = re.compile(r'^(remote\s+)(\S+)(\s+\d+)(.*)$')
 
-def replace_remote_line(line: str, new_host: str, new_port: int | None):
+def replace_remote_line(line: str, new_host: str, new_port: Optional[int]):
     """
     Если строка 'remote ...', заменяем host (и порт, если new_port задан).
-    Возвращаем (новая_строка, старый_host, старый_port) либо (line, None, None) если не изменено.
+    Возвращаем (новая_строка, старый_host, старый_port) либо (line, None, None).
     """
     m = REMOTE_LINE_REGEX.match(line.strip())
     if not m:
@@ -436,13 +436,14 @@ def replace_remote_line(line: str, new_host: str, new_port: int | None):
         new_line = f"{prefix}{new_host} {new_port}{tail}"
     else:
         new_line = f"{prefix}{new_host} {old_port}{tail}"
-    return new_line + ("\n" if not new_line.endswith("\n") else ""), old_host, old_port
+    if not new_line.endswith("\n"):
+        new_line += "\n"
+    return new_line, old_host, old_port
 
-def update_remote_in_file(path: str, new_host: str, new_port: int | None, ts: str):
+
+def update_remote_in_file(path: str, new_host: str, new_port: Optional[int], ts: str):
     """
-    Обновляет первую подходящую remote-строку в файле path.
-    Делает бэкап path.bak_<ts>.
-    Возвращает словарь с результатом или None если remote не найден.
+    Обновляет первую remote-строку в файле path. Делает бэкап path.bak_<ts>.
     """
     try:
         with open(path, "r") as f:
@@ -478,23 +479,45 @@ def update_remote_in_file(path: str, new_host: str, new_port: int | None, ts: st
     except Exception as e:
         return {"file": path, "error": f"write error: {e}"}
 
-def bulk_update_remote(new_host: str, new_port: int | None, keys_dir=KEYS_DIR, template_path=f"{OPENVPN_DIR}/client-template.txt"):
+
+def bulk_update_remote(new_host: str, new_port: Optional[int],
+                       keys_dir=KEYS_DIR,
+                       template_path=f"{OPENVPN_DIR}/client-template.txt"):
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     results = []
-    # Обновляем .ovpn
     for fname in os.listdir(keys_dir):
-        if not fname.endswith(".ovpn"):
-            continue
-        full = os.path.join(keys_dir, fname)
-        r = update_remote_in_file(full, new_host, new_port, ts)
-        if r:
-            results.append(r)
-    # Обновляем шаблон, если есть
+        if fname.endswith(".ovpn"):
+            full = os.path.join(keys_dir, fname)
+            r = update_remote_in_file(full, new_host, new_port, ts)
+            if r:
+                results.append(r)
     if os.path.exists(template_path):
         r = update_remote_in_file(template_path, new_host, new_port, ts)
         if r:
             results.append(r)
     return results
+
+
+async def send_updated_ovpn_files(chat_id: int, bot, files: List[str]):
+    """Отправка всех обновлённых .ovpn файлов (простая задержка против rate limit)."""
+    import asyncio
+    sent = 0
+    for path in files:
+        if not path.endswith(".ovpn"):
+            continue
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=InputFile(f),
+                        filename=os.path.basename(path)
+                    )
+                sent += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                print(f"[remote_send_all] error sending {path}: {e}")
+    return sent
 
 async def start_update_remote_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Кнопка "🌐 Обновить адрес"
