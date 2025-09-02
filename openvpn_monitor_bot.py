@@ -338,7 +338,7 @@ def build_traffic_report():
             total = rx + tx
             lines.append(
                 f"• <b>{name}</b>: {RX_ARROW}{ARROWS_SPACING}{format_gb(rx)} "
-                f"{TX_ARROW}{ARROWS_SPACING}{format_gb(tx)} (Σ --{format_gb(total)}--)"
+                f"{TX_ARROW}{ARROWS_SPACING}{format_gb(tx)} (общий  --{format_gb(total)}--)"
             )
         else:
             lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
