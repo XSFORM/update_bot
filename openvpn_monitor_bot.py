@@ -16,6 +16,10 @@ from telegram.ext import (
 
 from config import TOKEN, ADMIN_ID
 
+# --- Версия и URL для обновления (добавлено) ---
+BOT_VERSION = "2025-09-02"
+UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
+
 # --- Константы путей ---
 KEYS_DIR = "/root"
 OPENVPN_DIR = "/etc/openvpn"
@@ -25,18 +29,15 @@ BACKUP_DIR = "/root"
 STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
 
-# Файл-флаг для уведомлений о НОВЫХ подключениях (если оставляешь функционал)
 NOTIFY_FILE = "/root/monitor_bot/notify.flag"
 
 TM_TZ = pytz.timezone("Asia/Ashgabat")
 MGMT_SOCKET = "/var/run/openvpn.sock"
 
 # --- Порог тревоги и антиспам ---
-MIN_ONLINE_ALERT = 15          # Если онлайн клиентов меньше этого числа — предупреждение
-ALERT_INTERVAL_SEC = 300       # Не слать тревогу чаще, чем раз в 5 минут
-last_alert_time = 0            # Время последней тревоги (epoch)
-
-# Для отслеживания подключений/отключений
+MIN_ONLINE_ALERT = 15
+ALERT_INTERVAL_SEC = 300
+last_alert_time = 0
 clients_last_online = set()
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
@@ -235,6 +236,8 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
+        # Новая кнопка с командой обновления
+        [InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -263,36 +266,44 @@ def get_confirm_delete_keyboard(fname):
 
 HELP_TEXT = """
 <b>📖 Помощь по VPN Боту:</b>
-
-Этот бот управляет OpenVPN сервером и ключами через Telegram.
-
-<b>Основные возможности:</b>
-• <b>Статистика и онлайн-клиенты</b> — мониторинг подключений.
-• <b>Создание, обновление, удаление ключей</b> — быстрое управление доступом.
-• <b>Резервное копирование и восстановление</b> — защита конфигурации и ключей.
-• <b>Тревога блокировки</b> — уведомления при массовых отключениях (блокировка IP).
-
-<b>Типичные команды:</b>
-🔄 — показать список всех клиентов
-📊 — подробный статус всех ключей (кто онлайн, кто оффлайн)
-🟢 — только активные подключения
-⏳ — сколько дней осталось до истечения ключей
-➕ — создать новый VPN ключ (.ovpn)
-🗑️ — полностью удалить ключ и доступ
-✅/⚠️ — включить/отключить клиента (через CCD)
-📤 — получить .ovpn-файл в чат
-📦/🔄 — создать и восстановить бэкап всех настроек
-🚨 — включена тревога: если онлайн-клиентов станет слишком мало, придёт уведомление
-
-<b>Вопросы или проблемы?</b>
-Напиши <a href="https://t.me/XS_FORM">@XS_FORM</a> или используй /help для повторной справки.
-
-<b>Безопасность:</b>
-• Все команды доступны только администратору.
-• Ваши ключи и логи не выходят за пределы сервера.
-
-<b>Удачного VPN!</b>
+...
 """
+
+# ================== UPDATE COMMAND FEATURE ==================
+
+def build_update_commands():
+    short_cmd = f"curl -L -o /root/monitor_bot/openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && systemctl restart vpn_bot.service"
+    safe_cmd = (
+        "cd /root/monitor_bot && "
+        "cp openvpn_monitor_bot.py openvpn_monitor_bot.py.bak_$(date +%Y%m%d_%H%M%S) && "
+        f"curl -L -o openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && "
+        "python3 -m py_compile openvpn_monitor_bot.py && "
+        "systemctl restart vpn_bot.service"
+    )
+    return short_cmd, safe_cmd
+
+async def show_update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    short_cmd, safe_cmd = build_update_commands()
+    text = (
+        f"<b>Команда обновления бота</b> (версия: <code>{BOT_VERSION}</code>)\n\n"
+        "Простая:\n<code>" + short_cmd + "</code>\n\n"
+        "С бэкапом и проверкой:\n<code>" + safe_cmd + "</code>\n\n"
+        "Откат (пример):\n<code>cp /root/monitor_bot/openvpn_monitor_bot.py.bak_YYYYMMDD_HHMMSS "
+        " /root/monitor_bot/openvpn_monitor_bot.py && systemctl restart vpn_bot.service</code>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+async def send_update_cmd_via_button(chat_id: int, bot):
+    short_cmd, safe_cmd = build_update_commands()
+    text = (
+        f"<b>Обновление бота</b>\nТекущая версия: <code>{BOT_VERSION}</code>\n\n"
+        "Простая:\n<code>" + short_cmd + "</code>\n\n"
+        "Расширенная (с бэкапом):\n<code>" + safe_cmd + "</code>"
+    )
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 # ================== OVPN ГЕНЕРАЦИЯ / КЛЮЧИ ==================
 
@@ -350,6 +361,8 @@ def generate_ovpn_for_client(
     with open(ovpn_file, "w") as f:
         f.write(ovpn_content)
     return ovpn_file
+
+# === (остальные хендлеры создания/обновления/удаления ключей без изменений) ===
 
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('await_key_name'):
@@ -525,7 +538,6 @@ def set_notify(flag):
             os.remove(NOTIFY_FILE)
 
 async def notify_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # (Эта функция не вызывается сейчас кнопкой — можно удалить при желании)
     query = update.callback_query
     enabled = is_notify_enabled()
     set_notify(not enabled)
@@ -545,7 +557,6 @@ async def check_new_connections(app: Application):
             total_keys = len(get_ovpn_files())
             now = time.time()
 
-            # --- Тревога 0 клиентов ---
             if online_count == 0 and total_keys > 0:
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
                     await app.bot.send_message(
@@ -554,7 +565,6 @@ async def check_new_connections(app: Application):
                         parse_mode="HTML"
                     )
                     last_alert_time = now
-            # --- Тревога: мало клиентов ---
             elif 0 < online_count < MIN_ONLINE_ALERT:
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
                     await app.bot.send_message(
@@ -564,12 +574,9 @@ async def check_new_connections(app: Application):
                     )
                     last_alert_time = now
             else:
-                # Если всё нормальное — сбрасываем, чтобы при следующем падении тревога пришла сразу
                 if online_count >= MIN_ONLINE_ALERT:
                     last_alert_time = 0
 
-            # Уведомления о новых подключениях удалены!
-            
             clients_last_online = set(online_names)
             await asyncio.sleep(10)
         except Exception as e:
@@ -579,6 +586,9 @@ async def check_new_connections(app: Application):
 # ================== ХЕНДЛЕРЫ TELEGRAM ==================
 
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
     if context.user_data.get('await_key_name') or context.user_data.get('await_key_expiry'):
         await create_key_handler(update, context)
     elif context.user_data.get('await_renew_expiry'):
@@ -633,13 +643,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    await update.message.reply_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
+    await update.message.reply_text(f"Добро пожаловать в VPN бот!\nВерсия: <code>{BOT_VERSION}</code>", parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text(HELP_TEXT.replace("...", f"(версия {BOT_VERSION})"), parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -853,7 +863,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
     elif data == 'help':
-        msgs = split_message(HELP_TEXT)
+        msgs = split_message(HELP_TEXT.replace("...", f"(версия {BOT_VERSION})"))
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for m in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
@@ -899,19 +909,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Тревога активна в фоне.\n"
             f"Порог: < {MIN_ONLINE_ALERT} / интервал антиспама: {ALERT_INTERVAL_SEC}s.\n"
-            "Изменить можно в коде (MIN_ONLINE_ALERT / ALERT_INTERVAL_SEC).",
+            "Изменить можно в коде.",
             reply_markup=get_main_keyboard()
         )
+    elif data == 'update_info':
+        await send_update_cmd_via_button(update.effective_chat.id, context.bot)
     else:
         await query.edit_message_text("Команда не реализована.", reply_markup=get_main_keyboard())
-
-# ================== DOCUMENT / FILE HANDLERS ==================
-
-async def universal_guard(update: Update):
-    if update.effective_user and update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return False
-    return True
 
 # ================== MAIN ==================
 
@@ -922,13 +926,12 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
+    app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))   # новая команда
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
 
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CallbackQueryHandler(restore_confirm_handler, pattern='^restore_confirm$'))
-    app.add_handler(CallbackQueryHandler(restore_cancel_handler, pattern='^restore_cancel$'))
 
     import asyncio
     loop = asyncio.get_event_loop()
