@@ -297,7 +297,7 @@ def build_traffic_report():
     items = sorted(traffic_usage.items(), key=lambda x: x[1], reverse=True)
     lines = ["<b>Использование трафика (RX+TX):</b>"]
     for name, total in items:
-        lines.append(f"• <b>{name}</b>:        --{format_bytes_gb(total)}--")
+        lines.append(f"• <b>{name}</b>: --{format_bytes_gb(total)}--")
     return "\n".join(lines)
 
 def update_traffic_from_status(clients):
