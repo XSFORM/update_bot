@@ -287,7 +287,7 @@ def save_traffic_db(force=False):
 
 def format_bytes_gb(b):
     try:
-        return f"{int(b)/1024/1024/1024:.4f} GB"
+        return f"{int(b)/1024/1024/1024:.1f} GB"
     except:
         return "0 GB"
 
