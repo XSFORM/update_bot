@@ -266,7 +266,29 @@ def load_traffic_db():
     try:
         if os.path.exists(TRAFFIC_DB_PATH):
             with open(TRAFFIC_DB_PATH, "r") as f:
-                traffic_usage = json.load(f)
+                raw = json.load(f)
+            migrated = {}
+            changed = False
+            for k, v in raw.items():
+                if isinstance(v, dict) and 'rx' in v and 'tx' in v:
+                    # нормальный новый формат
+                    migrated[k] = {
+                        'rx': int(v.get('rx', 0)),
+                        'tx': int(v.get('tx', 0))
+                    }
+                elif isinstance(v, int):
+                    # старый total -> в RX, TX=0 (или можно поделить/оставить в total)
+                    migrated[k] = {'rx': v, 'tx': 0}
+                    changed = True
+                else:
+                    # неизвестно — обнуляем
+                    migrated[k] = {'rx': 0, 'tx': 0}
+                    changed = True
+            traffic_usage = migrated
+            if changed:
+                save_traffic_db(force=True)
+        else:
+            traffic_usage = {}
     except Exception as e:
         print(f"[traffic] load error: {e}")
         traffic_usage = {}
@@ -294,13 +316,31 @@ def format_bytes_gb(b):
 def build_traffic_report():
     if not traffic_usage:
         return "<b>Трафик:</b>\nПока нет накопленных данных."
-    items = sorted(traffic_usage.items(), key=lambda x: x[1], reverse=True)
-    lines = ["<b>Использование трафика (RX+TX):</b>"]
-    for name, total in items:
-        lines.append(f"• <b>{name}</b>: --{format_bytes_gb(total)}--")
+    # сортируем по сумме rx+tx
+    items = sorted(
+        traffic_usage.items(),
+        key=lambda x: (x[1]['rx'] + x[1]['tx']) if isinstance(x[1], dict) else x[1],
+        reverse=True
+    )
+    lines = ["<b>Использование трафика:</b>"]
+    for name, val in items:
+        if isinstance(val, dict):
+            rx = val.get('rx', 0)
+            tx = val.get('tx', 0)
+            total = rx + tx
+            lines.append(
+                f"• <b>{name}</b>: ↓{format_gb(rx)} ↑{format_gb(tx)} (Σ 🟢{format_gb(total)}🟢)"
+            )
+        else:
+            # fallback если внезапно старый формат
+            lines.append(f"• <b>{name}</b>: --{format_bytes_gb(total)}--")
     return "\n".join(lines)
 
 def update_traffic_from_status(clients):
+    """
+    Пересчитывает накопительный трафик (раздельно RX/TX) на основе дельт текущей сессии.
+    При новой сессии (connected_since изменился) — baseline обновляется без добавления.
+    """
     global traffic_usage, _last_session_state
     changed = False
     for c in clients:
@@ -310,30 +350,39 @@ def update_traffic_from_status(clients):
             sent = int(c.get('bytes_sent', 0))
         except:
             continue
-        session_total = recv + sent
         connected_since = c.get('connected_since', '')
         prev = _last_session_state.get(name)
 
         if name not in traffic_usage:
-            traffic_usage[name] = 0
+            traffic_usage[name] = {'rx': 0, 'tx': 0}
 
-        # Новая сессия (или бот перезапущен) => просто фиксируем baseline
+        # новая сессия или нет baseline
         if prev is None or prev['connected_since'] != connected_since:
             _last_session_state[name] = {
                 'connected_since': connected_since,
-                'total': session_total
+                'rx': recv,
+                'tx': sent
             }
             continue
 
-        last_total = prev['total']
-        delta = session_total - last_total
-        if delta > 0:
-            traffic_usage[name] += delta
-            prev['total'] = session_total
+        # старая сессия — считаем дельты
+        delta_rx = recv - prev['rx']
+        delta_tx = sent - prev['tx']
+
+        if delta_rx > 0:
+            traffic_usage[name]['rx'] += delta_rx
+            prev['rx'] = recv
             changed = True
         else:
-            # delta <= 0 — обновим baseline, чтобы не зависло
-            prev['total'] = session_total
+            prev['rx'] = recv  # обновляем baseline (обнуление или rollback счётчика OpenVPN)
+
+        if delta_tx > 0:
+            traffic_usage[name]['tx'] += delta_tx
+            prev['tx'] = sent
+            changed = True
+        else:
+            prev['tx'] = sent
+
     if changed:
         save_traffic_db()
 
