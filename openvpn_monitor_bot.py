@@ -287,9 +287,18 @@ def save_traffic_db(force=False):
 
 def format_bytes_gb(b):
     try:
-        return f"{int(b)/1024/1024/1024:.1f} GB"
+        return f"{int(b)/1024/1024/1024:.2f} GB"
     except:
         return "0 GB"
+
+DECOR_STYLE = "green"   # "green" | "dashes" | "none"
+
+def decorate(val):
+    if DECOR_STYLE == "green":
+        return f"🟢{val}🟢"
+    if DECOR_STYLE == "dashes":
+        return f"--{val}--"
+    return val
 
 def build_traffic_report():
     if not traffic_usage:
@@ -297,7 +306,7 @@ def build_traffic_report():
     items = sorted(traffic_usage.items(), key=lambda x: x[1], reverse=True)
     lines = ["<b>Использование трафика (RX+TX):</b>"]
     for name, total in items:
-        lines.append(f"• <b>{name}</b>: {format_bytes_gb(total)}")
+        lines.append(f"• <b>{name}</b>: {decorate(format_bytes_gb(total))}")
     return "\n".join(lines)
 
 def update_traffic_from_status(clients):
