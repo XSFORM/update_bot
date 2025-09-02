@@ -39,11 +39,6 @@ last_alert_time = 0            # Время последней тревоги (e
 # Для отслеживания подключений/отключений
 clients_last_online = set()
 
-# --- Самообновление (просто версия без проверок) ---
-UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
-LOCAL_BOT_PATH = "/root/monitor_bot/openvpn_monitor_bot.py"
-SYSTEMD_SERVICE_NAME = "vpn_bot.service"
-
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 
 def get_cert_expiry_info():
@@ -240,7 +235,6 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
-        [InlineKeyboardButton("🆕 Обновить бота", callback_data='self_update')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -574,6 +568,8 @@ async def check_new_connections(app: Application):
                 if online_count >= MIN_ONLINE_ALERT:
                     last_alert_time = 0
 
+            # Уведомления о новых подключениях удалены!
+            
             clients_last_online = set(online_names)
             await asyncio.sleep(10)
         except Exception as e:
@@ -822,66 +818,6 @@ async def restore_cancel_handler(update: Update, context: ContextTypes.DEFAULT_T
     await update.callback_query.answer("Отменено.")
     await update.callback_query.edit_message_text("Восстановление отменено.", reply_markup=get_main_keyboard())
 
-# ================== САМООБНОВЛЕНИЕ ==================
-
-def _download_new_version():
-    """
-    Скачивает новую версию файла. Возвращает (ok: bool, detail: str).
-    """
-    try:
-        r = subprocess.run(
-            ["wget", "-q", UPDATE_SOURCE_URL, "-O", LOCAL_BOT_PATH],
-            capture_output=True
-        )
-        if r.returncode != 0:
-            return False, r.stderr.decode() or "Неизвестная ошибка wget"
-        size = os.path.getsize(LOCAL_BOT_PATH)
-        return True, f"Новый файл сохранён ({size} байт)."
-    except Exception as e:
-        return False, str(e)
-
-def _restart_service():
-    """
-    Перезапуск systemd сервиса. Возвращает (ok: bool, detail: str).
-    """
-    try:
-        r = subprocess.run(
-            ["systemctl", "restart", SYSTEMD_SERVICE_NAME],
-            capture_output=True
-        )
-        if r.returncode != 0:
-            return False, r.stderr.decode() or "Неизвестная ошибка systemctl"
-        return True, "Сервис перезапущен."
-    except Exception as e:
-        return False, str(e)
-
-async def update_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Обновление бота... (скачиваю новую версию)")
-    ok, detail = _download_new_version()
-    if not ok:
-        await update.message.reply_text(f"❌ Ошибка загрузки: {detail}")
-        return
-    await update.message.reply_text(f"✅ {detail}\n♻️ Перезапускаю сервис...")
-    ok2, detail2 = _restart_service()
-    if ok2:
-        await update.message.reply_text("🎉 Обновление завершено. (Если бот исчез — он перезапускается)")
-    else:
-        await update.message.reply_text(f"⚠️ Файл обновлён, но не удалось перезапустить: {detail2}")
-
-async def self_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.edit_message_text("⏳ Обновление бота... (скачиваю новую версию)")
-    ok, detail = _download_new_version()
-    if not ok:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Ошибка загрузки: {detail}", reply_markup=get_main_keyboard())
-        return
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"✅ {detail}\n♻️ Перезапускаю сервис...")
-    ok2, detail2 = _restart_service()
-    if ok2:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="🎉 Обновление завершено. Бот перезапускается.")
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Файл обновлён, но не удалось перезапустить: {detail2}")
-
 # ================== BUTTON HANDLER ==================
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -966,8 +902,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Изменить можно в коде (MIN_ONLINE_ALERT / ALERT_INTERVAL_SEC).",
             reply_markup=get_main_keyboard()
         )
-    elif data == 'self_update':
-        await self_update_handler(update, context)
     else:
         await query.edit_message_text("Команда не реализована.", reply_markup=get_main_keyboard())
 
@@ -979,22 +913,6 @@ async def universal_guard(update: Update):
         return False
     return True
 
-# ================== ДОП. ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ==================
-def format_online_clients(clients, online_names, tunnel_ips):
-    res = []
-    for c in clients:
-        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
-            tunnel_ip = tunnel_ips.get(c['name'], 'нет')
-            res.append(
-                f"🟢 <b>{c['name']}</b>\n"
-                f"🌐 <code>{c.get('ip','нет')}</code>\n"
-                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
-                f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
-                f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
-                + "-"*15
-            )
-    return "<b>Онлайн клиенты:</b>\n\n" + ("\n".join(res) if res else "Нет активных клиентов.")
-
 # ================== MAIN ==================
 
 def main():
@@ -1004,7 +922,6 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
-    app.add_handler(CommandHandler("update_bot", update_bot_command))  # команда обновления
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
