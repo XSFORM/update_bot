@@ -343,6 +343,21 @@ def build_traffic_report():
         else:
             lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
     return "\n".join(lines)
+    
+def clear_traffic_stats():
+    """Полная очистка накопленного трафика и baseline сессий."""
+    global traffic_usage, _last_session_state
+    traffic_usage = {}
+    _last_session_state = {}
+    # создадим бэкап перед очисткой (опционально — можно убрать)
+    try:
+        if os.path.exists(TRAFFIC_DB_PATH):
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            backup_copy = TRAFFIC_DB_PATH + f".bak_{ts}"
+            subprocess.run(f"cp {TRAFFIC_DB_PATH} {backup_copy}", shell=True)
+    except Exception as e:
+        print(f"[traffic] backup before clear error: {e}")
+    save_traffic_db(force=True)    
 
 def update_traffic_from_status(clients):
     global traffic_usage, _last_session_state
@@ -399,7 +414,8 @@ HELP_TEXT = f"""
 • Включение / отключение клиента (CCD)
 • Бэкап / восстановление
 • Тревога по количеству онлайн
-• Накопительный трафик (кнопка 📶 Трафик / команда /traffic)
+• Накопительный трафик (📶 Трафик / /traffic)
+• Очистка трафика (🧹 Очистить трафик)
 • Вывод команд обновления (🔗 Обновление / /show_update_cmd)
 
 Все команды доступны только администратору.
@@ -411,7 +427,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
         [InlineKeyboardButton("📶 Трафик", callback_data='traffic'),
-         InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
+         InlineKeyboardButton("🧹 Очистить трафик", callback_data='traffic_clear')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
          InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
         [InlineKeyboardButton("✅ Вкл.клиента", callback_data='enable'),
@@ -422,7 +438,8 @@ def get_main_keyboard():
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
-        [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
+        [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert'),
+         InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -507,6 +524,13 @@ def generate_ovpn_for_client(
     return ovpn_file
 
 # --- Create / Renew key handlers ---
+
+async def clear_traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    clear_traffic_stats()
+    await update.message.reply_text("✅ Трафик очищен.", reply_markup=get_main_keyboard())
 
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('await_key_name'):
@@ -1010,6 +1034,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_traffic_db(force=True)
         report = build_traffic_report()
         await query.edit_message_text(report, parse_mode="HTML", reply_markup=get_main_keyboard())
+        
+    elif data == 'traffic_clear':
+        # Запрос подтверждения
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, очистить", callback_data="confirm_clear_traffic")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_clear_traffic")],
+        ])
+        await query.edit_message_text(
+            "Очистить накопленный трафик? Это удалит все RX/TX значения.\n"
+            "Перед очисткой создана резервная копия файла (traffic_usage.json.bak_TIMESTAMP).",
+            reply_markup=kb
+        )
+
+    elif data == 'confirm_clear_traffic':
+        clear_traffic_stats()
+        await query.edit_message_text("✅ Трафик очищен.", parse_mode="HTML", reply_markup=get_main_keyboard())
+
+    elif data == 'cancel_clear_traffic':
+        await query.edit_message_text("Отменено. Трафик не изменён.", reply_markup=get_main_keyboard())    
 
     elif data == 'update_info':
         await send_update_cmd_via_button(update.effective_chat.id, context.bot)
@@ -1096,6 +1139,7 @@ def main():
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
     app.add_handler(CommandHandler("traffic", traffic_command))
+    app.add_handler(CommandHandler("clear_traffic", clear_traffic_command))
     app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
