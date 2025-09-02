@@ -6,7 +6,6 @@ from datetime import date, datetime, timedelta
 from typing import Optional, Tuple, List
 import glob
 import json
-import re
 from OpenSSL import crypto
 import pytz
 
@@ -20,7 +19,7 @@ from telegram.ext import (
 from config import TOKEN, ADMIN_ID
 
 # ---------------- Версия и обновление (вывод команд) ----------------
-BOT_VERSION = "2025-09-02"
+BOT_VERSION = "2025-09-02-fixed1"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 
 def build_update_commands():
@@ -84,8 +83,8 @@ _last_traffic_save_time = 0
 TRAFFIC_SAVE_INTERVAL = 60
 
 # --- Стрелки для отчёта трафика ---
-RX_ARROW = "🔻"   # server received from client
-TX_ARROW = "🔺"   # server sent to client
+RX_ARROW = "🔻"   # server received from client (upload клиента)
+TX_ARROW = "🔺"   # server sent to client (download клиента)
 ARROWS_SPACING = ""
 
 # ================== Базовые вспомогательные ==================
@@ -397,7 +396,7 @@ def clear_traffic_stats():
     save_traffic_db(force=True)
 
 # ================== REMOTE (массовое обновление remote) ==================
-### REMOTE UPDATE START
+### REMOTE UPDATE START (упрощённая версия без regex, совместима с Python 3.9)
 
 def parse_new_remote(input_str: str) -> Tuple[Optional[str], Optional[int]]:
     """
@@ -421,29 +420,39 @@ def parse_new_remote(input_str: str) -> Tuple[Optional[str], Optional[int]]:
         return host, None
     return s, None
 
-
 def replace_remote_line(line: str, new_host: str, new_port: Optional[int]):
     """
-    Если строка 'remote ...', заменяем host (и порт, если new_port задан).
+    Если строка начинается с 'remote ' (игнорируя пробелы в начале),
+    заменяем host и (если задан) порт.
     Возвращаем (новая_строка, старый_host, старый_port) либо (line, None, None).
     """
-    m = REMOTE_LINE_REGEX.match(line.strip())
-    if not m:
-        return line, None, None
-    prefix, old_host, port_part, tail = m.groups()
-    old_port = port_part.strip()
+    original = line
+    stripped = line.lstrip()
+    if not stripped.startswith("remote "):
+        return original, None, None
+
+    # Ведущие пробелы
+    leading = line[:len(line) - len(stripped)]
+    parts = stripped.split()
+    if len(parts) < 3:
+        return original, None, None  # не стандартный формат
+
+    old_host = parts[1]
+    old_port = parts[2]
+
+    parts[1] = new_host
     if new_port is not None:
-        new_line = f"{prefix}{new_host} {new_port}{tail}"
-    else:
-        new_line = f"{prefix}{new_host} {old_port}{tail}"
+        parts[2] = str(new_port)
+
+    new_line = leading + " ".join(parts)
     if not new_line.endswith("\n"):
         new_line += "\n"
     return new_line, old_host, old_port
 
-
 def update_remote_in_file(path: str, new_host: str, new_port: Optional[int], ts: str):
     """
-    Обновляет первую remote-строку в файле path. Делает бэкап path.bak_<ts>.
+    Обновляет первую найденную строку remote в файле.
+    Делает бэкап path.bak_<ts>. Возвращает dict результата или None если не найдено.
     """
     try:
         with open(path, "r") as f:
@@ -457,10 +466,14 @@ def update_remote_in_file(path: str, new_host: str, new_port: Optional[int], ts:
         if line.lstrip().startswith("remote "):
             new_line, oh, op = replace_remote_line(line, new_host, new_port)
             if oh is not None:
+                # Если реально ничего не меняется (тот же host и порт) — пропускаем (не плодим бэкап)
+                if oh == new_host and ((new_port is None and op == op) or (new_port is not None and str(new_port) == op)):
+                    break
                 lines[i] = new_line
                 old_host, old_port = oh, op
                 changed = True
                 break
+
     if not changed:
         return None
 
@@ -479,7 +492,6 @@ def update_remote_in_file(path: str, new_host: str, new_port: Optional[int], ts:
     except Exception as e:
         return {"file": path, "error": f"write error: {e}"}
 
-
 def bulk_update_remote(new_host: str, new_port: Optional[int],
                        keys_dir=KEYS_DIR,
                        template_path=f"{OPENVPN_DIR}/client-template.txt"):
@@ -497,7 +509,6 @@ def bulk_update_remote(new_host: str, new_port: Optional[int],
             results.append(r)
     return results
 
-
 async def send_updated_ovpn_files(chat_id: int, bot, files: List[str]):
     """Отправка всех обновлённых .ovpn файлов (простая задержка против rate limit)."""
     import asyncio
@@ -514,7 +525,7 @@ async def send_updated_ovpn_files(chat_id: int, bot, files: List[str]):
                         filename=os.path.basename(path)
                     )
                 sent += 1
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.3)  # микропаузa
             except Exception as e:
                 print(f"[remote_send_all] error sending {path}: {e}")
     return sent
@@ -555,7 +566,7 @@ async def process_new_remote_input(update: Update, context: ContextTypes.DEFAULT
     updated = [r for r in results if 'error' not in r]
     errors = [r for r in results if 'error' in r]
 
-    # Сохраняем список обновлённых .ovpn (для последующей массовой отправки)
+    # Список обновлённых .ovpn (для последующей массовой отправки)
     updated_ovpn_files = [r['file'] for r in updated if r['file'].endswith(".ovpn")]
     context.user_data['updated_remote_files'] = updated_ovpn_files
 
@@ -580,7 +591,6 @@ async def process_new_remote_input(update: Update, context: ContextTypes.DEFAULT
         if len(errors) > 3:
             lines.append(f"... ещё {len(errors)-3} ошибок")
 
-    # Клавиатура подтверждения отправки всех обновлённых ключей
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Отправить все ключи", callback_data="remote_send_all")],
         [InlineKeyboardButton("❌ Не отправлять", callback_data="remote_send_cancel")],
@@ -591,23 +601,6 @@ async def process_new_remote_input(update: Update, context: ContextTypes.DEFAULT
         parse_mode="HTML",
         reply_markup=kb
     )
-    
-async def send_updated_ovpn_files(chat_id: int, bot, files: list):
-    """Отправка всех обновлённых .ovpn файлов (с простейшей защитой от rate limit)."""
-    import asyncio
-    sent = 0
-    for path in files:
-        if not path.endswith(".ovpn"):
-            continue
-        if os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    await bot.send_document(chat_id=chat_id, document=InputFile(f), filename=os.path.basename(path))
-                sent += 1
-                await asyncio.sleep(0.3)  # лёгкая пауза (при 50+ файлов можно увеличить)
-            except Exception as e:
-                print(f"[remote_send_all] error sending {path}: {e}")
-    return sent    
 
 ### REMOTE UPDATE END
 # ================== UI / HELP ==================
@@ -1257,7 +1250,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_update_remote_flow(update, context)
     elif data == 'cancel_update_remote':
         await cancel_update_remote(update, context)
-        
+
     elif data == 'remote_send_all':
         files = context.user_data.pop('updated_remote_files', [])
         if not files:
@@ -1273,7 +1266,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'remote_send_cancel':
         context.user_data.pop('updated_remote_files', None)
-        await query.edit_message_text("Отправка отменена.", reply_markup=get_main_keyboard())    
+        await query.edit_message_text("Отправка отменена.", reply_markup=get_main_keyboard())
 
     elif data == 'update_info':
         await send_update_cmd_via_button(update.effective_chat.id, context.bot)
@@ -1361,7 +1354,7 @@ def main():
     app.add_handler(CommandHandler("online", online_command))
     app.add_handler(CommandHandler("traffic", traffic_command))
     app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))
-    # (опционально можно добавить команду для remote позднее)
+    # Можно добавить отдельную команду для remote позже
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
