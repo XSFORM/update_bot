@@ -76,10 +76,14 @@ clients_last_online = set()
 
 # --- Учёт трафика ---
 TRAFFIC_DB_PATH = "/root/monitor_bot/traffic_usage.json"
-traffic_usage = {}              # client_name -> total_bytes
-_last_session_state = {}        # client_name -> {'connected_since': str, 'total': int}
+# Структура накопительного трафика:
+# traffic_usage[name] = {"rx": <int>, "tx": <int>}
+traffic_usage = {}
+# Состояние текущей (последней) сессии клиента для расчёта дельт:
+# _last_session_state[name] = {"connected_since": <str>, "rx": <int>, "tx": <int>}
+_last_session_state = {}
 _last_traffic_save_time = 0
-TRAFFIC_SAVE_INTERVAL = 60      # сек между автосохранениями
+TRAFFIC_SAVE_INTERVAL = 60  # сек между автосохранениями
 
 # ================== Базовые вспомогательные ==================
 
@@ -259,6 +263,19 @@ def kill_openvpn_session(client_name):
             print(f"[kill_openvpn_session] Ошибка: {e}")
     return False
 
+# --- Форматирование трафика ---
+def format_bytes_gb(b):
+    try:
+        return f"{int(b)/1024/1024/1024:.2f} GB"
+    except:
+        return "0.00 GB"
+
+def format_gb(v_bytes):
+    try:
+        return f"{v_bytes/1024/1024/1024:.2f} GB"
+    except Exception:
+        return "0.00 GB"
+
 # ================== Трафик ==================
 
 def load_traffic_db():
@@ -271,17 +288,11 @@ def load_traffic_db():
             changed = False
             for k, v in raw.items():
                 if isinstance(v, dict) and 'rx' in v and 'tx' in v:
-                    # нормальный новый формат
-                    migrated[k] = {
-                        'rx': int(v.get('rx', 0)),
-                        'tx': int(v.get('tx', 0))
-                    }
+                    migrated[k] = {'rx': int(v.get('rx', 0)), 'tx': int(v.get('tx', 0))}
                 elif isinstance(v, int):
-                    # старый total -> в RX, TX=0 (или можно поделить/оставить в total)
                     migrated[k] = {'rx': v, 'tx': 0}
                     changed = True
                 else:
-                    # неизвестно — обнуляем
                     migrated[k] = {'rx': 0, 'tx': 0}
                     changed = True
             traffic_usage = migrated
@@ -307,16 +318,9 @@ def save_traffic_db(force=False):
     except Exception as e:
         print(f"[traffic] save error: {e}")
 
-def format_bytes_gb(b):
-    try:
-        return f"{int(b)/1024/1024/1024:.2f} GB"
-    except:
-        return "0.00 GB"
-
 def build_traffic_report():
     if not traffic_usage:
         return "<b>Трафик:</b>\nПока нет накопленных данных."
-    # сортируем по сумме rx+tx
     items = sorted(
         traffic_usage.items(),
         key=lambda x: (x[1]['rx'] + x[1]['tx']) if isinstance(x[1], dict) else x[1],
@@ -329,18 +333,14 @@ def build_traffic_report():
             tx = val.get('tx', 0)
             total = rx + tx
             lines.append(
-                f"• <b>{name}</b>: ↓{format_gb(rx)} ↑{format_gb(tx)} (Σ 🟢{format_gb(total)}🟢)"
+                f"• <b>{name}</b>: ↓{format_gb(rx)} ↑{format_gb(tx)} (Σ --{format_gb(total)}--)"
             )
         else:
-            # fallback если внезапно старый формат
-            lines.append(f"• <b>{name}</b>: --{format_bytes_gb(total)}--")
+            # fallback на старый формат (число total)
+            lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
     return "\n".join(lines)
 
 def update_traffic_from_status(clients):
-    """
-    Пересчитывает накопительный трафик (раздельно RX/TX) на основе дельт текущей сессии.
-    При новой сессии (connected_since изменился) — baseline обновляется без добавления.
-    """
     global traffic_usage, _last_session_state
     changed = False
     for c in clients:
@@ -356,7 +356,6 @@ def update_traffic_from_status(clients):
         if name not in traffic_usage:
             traffic_usage[name] = {'rx': 0, 'tx': 0}
 
-        # новая сессия или нет baseline
         if prev is None or prev['connected_since'] != connected_since:
             _last_session_state[name] = {
                 'connected_since': connected_since,
@@ -365,7 +364,6 @@ def update_traffic_from_status(clients):
             }
             continue
 
-        # старая сессия — считаем дельты
         delta_rx = recv - prev['rx']
         delta_tx = sent - prev['tx']
 
@@ -374,7 +372,7 @@ def update_traffic_from_status(clients):
             prev['rx'] = recv
             changed = True
         else:
-            prev['rx'] = recv  # обновляем baseline (обнуление или rollback счётчика OpenVPN)
+            prev['rx'] = recv
 
         if delta_tx > 0:
             traffic_usage[name]['tx'] += delta_tx
@@ -504,7 +502,7 @@ def generate_ovpn_for_client(
         f.write(ovpn_content)
     return ovpn_file
 
-# --- Create / Renew key handlers (как раньше) ---
+# --- Create / Renew key handlers ---
 
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('await_key_name'):
