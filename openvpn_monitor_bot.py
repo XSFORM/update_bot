@@ -76,14 +76,18 @@ clients_last_online = set()
 
 # --- Учёт трафика ---
 TRAFFIC_DB_PATH = "/root/monitor_bot/traffic_usage.json"
-# Структура накопительного трафика:
-# traffic_usage[name] = {"rx": <int>, "tx": <int>}
+# traffic_usage[name] = {"rx": int, "tx": int}
 traffic_usage = {}
-# Состояние текущей (последней) сессии клиента для расчёта дельт:
-# _last_session_state[name] = {"connected_since": <str>, "rx": <int>, "tx": <int>}
+# _last_session_state[name] = {"connected_since": str, "rx": int, "tx": int}
 _last_session_state = {}
 _last_traffic_save_time = 0
-TRAFFIC_SAVE_INTERVAL = 60  # сек между автосохранениями
+TRAFFIC_SAVE_INTERVAL = 60
+
+# --- Настройка стрелок для отчёта трафика ---
+# Выбран вариант: толстые красные треугольники
+RX_ARROW = "🔻"   # входящий (server received from client)
+TX_ARROW = "🔺"   # исходящий (server sent to client)
+ARROWS_SPACING = ""  # можно поставить пробел " " если нужно
 
 # ================== Базовые вспомогательные ==================
 
@@ -333,10 +337,10 @@ def build_traffic_report():
             tx = val.get('tx', 0)
             total = rx + tx
             lines.append(
-                f"• <b>{name}</b>: ↓{format_gb(rx)} ↑{format_gb(tx)} (Σ --{format_gb(total)}--)"
+                f"• <b>{name}</b>: {RX_ARROW}{ARROWS_SPACING}{format_gb(rx)} "
+                f"{TX_ARROW}{ARROWS_SPACING}{format_gb(tx)} (Σ --{format_gb(total)}--)"
             )
         else:
-            # fallback на старый формат (число total)
             lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
     return "\n".join(lines)
 
@@ -727,7 +731,6 @@ async def check_new_connections(app: Application):
     while True:
         try:
             clients, online_names, tunnel_ips = parse_openvpn_status()
-            # учёт трафика
             update_traffic_from_status(clients)
 
             online_count = len(online_names)
@@ -1086,10 +1089,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # загрузка трафика
     load_traffic_db()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
@@ -1097,11 +1098,8 @@ def main():
     app.add_handler(CommandHandler("traffic", traffic_command))
     app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))
 
-    # Сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-
-    # Callback
     app.add_handler(CallbackQueryHandler(button_handler))
 
     import asyncio
