@@ -658,7 +658,7 @@ def get_keys_keyboard(keys):
 
 def get_delete_keys_keyboard(keys):
     keyboard = []
-    for i, fname in enumerate(keys, 1):
+    for i, fname in enumerate(sorted(keys), 1):
         keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"delete_{fname}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
     return InlineKeyboardMarkup(keyboard)
