@@ -651,7 +651,7 @@ def get_main_keyboard():
 
 def get_keys_keyboard(keys):
     keyboard = []
-    for i, fname in enumerate(keys, 1):
+    for i, fname in enumerate(sorted(keys), 1):
         keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"key_{i}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
     return InlineKeyboardMarkup(keyboard)
@@ -783,7 +783,7 @@ async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("Нет ключей для обновления.", reply_markup=get_main_keyboard())
         return
     keyboard = []
-    for i, fname in enumerate(keys, 1):
+    for i, fname in enumerate(sorted(keys), 1):
         keyboard.append([InlineKeyboardButton(f"{i}. {fname[:-5]}", callback_data=f"renew_{fname}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
     await update.callback_query.edit_message_text(
