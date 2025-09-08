@@ -1180,18 +1180,23 @@ async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAUL
 # ================== Button Handler ==================
 
 def format_online_clients(clients, online_names, tunnel_ips):
+    # Фильтруем только онлайн и не заблокированных, затем сортируем по имени
+    filtered = [
+        c for c in clients
+        if c['name'] in online_names and not is_client_ccd_disabled(c['name'])
+    ]
+    filtered_sorted = sorted(filtered, key=lambda c: c['name'].lower())
     res = []
-    for c in clients:
-        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
-            tunnel_ip = tunnel_ips.get(c['name'], 'нет')
-            res.append(
-                f"🟢 <b>{c['name']}</b>\n"
-                f"🌐 <code>{c.get('ip','нет')}</code>\n"
-                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
-                f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
-                f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
-                + "-"*15
-            )
+    for c in filtered_sorted:
+        tunnel_ip = tunnel_ips.get(c['name'], 'нет')
+        res.append(
+            f"🟢 <b>{c['name']}</b>\n"
+            f"🌐 <code>{c.get('ip','нет')}</code>\n"
+            f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
+            f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
+            f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
+            + "-"*15
+        )
     return "<b>Онлайн клиенты:</b>\n\n" + ("\n".join(res) if res else "Нет активных клиентов.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
