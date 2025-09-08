@@ -324,18 +324,13 @@ def build_traffic_report():
         key=lambda x: (x[1]['rx'] + x[1]['tx']) if isinstance(x[1], dict) else x[1],
         reverse=True
     )
-    lines = ["<b>Использование трафика:</b>"]
+    lines = ["<b>Использование трафика (суммарно):</b>"]
     for name, val in items:
         if isinstance(val, dict):
-            rx = val.get('rx', 0)
-            tx = val.get('tx', 0)
-            total = rx + tx
-            lines.append(
-                f"• <b>{name}</b>: {RX_ARROW}{ARROWS_SPACING}{format_gb(rx)} "
-                f"{TX_ARROW}{ARROWS_SPACING}{format_gb(tx)} (= --{format_gb(total)}--)"
-            )
+            total = val.get('rx', 0) + val.get('tx', 0)
+            lines.append(f"• <b>{name}</b>: --{format_gb(total)}--")
         else:
-            lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
+            lines.append(f"• <b>{name}</b>: --{format_gb(val)}--")
     return "\n".join(lines)
 
 def update_traffic_from_status(clients):
