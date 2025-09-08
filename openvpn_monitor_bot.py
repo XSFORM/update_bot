@@ -1277,17 +1277,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await view_keys_expiry_handler(update, context)
         
     elif data == 'send_ipp':
-    ipp_path = "/etc/openvpn/ipp.txt"
-    if os.path.exists(ipp_path):
-        with open(ipp_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=InputFile(f),
-                filename="ipp.txt"
-            )
-        await query.edit_message_text("Файл ipp.txt отправлен.", reply_markup=get_main_keyboard())
-    else:
-        await query.edit_message_text("Файл ipp.txt не найден.", reply_markup=get_main_keyboard())    
+        ipp_path = "/etc/openvpn/ipp.txt"
+        if os.path.exists(ipp_path):
+            with open(ipp_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=InputFile(f),
+                    filename="ipp.txt"
+                )
+            await query.edit_message_text("Файл ipp.txt отправлен.", reply_markup=get_main_keyboard())
+        else:
+            await query.edit_message_text("Файл ipp.txt не найден.", reply_markup=get_main_keyboard())    
 
     elif data == 'help':
         msgs = split_message(HELP_TEXT)
