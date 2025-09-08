@@ -618,6 +618,7 @@ HELP_TEXT = f"""
 • Очистка трафика (🧹 Очистить трафик)
 • Массовое обновление remote адреса (🌐 Обновить адрес)
 • Вывод команд обновления (🔗 Обновление / /show_update_cmd)
+• Отправка ipp.txt (🛣️ Тунель)
 
 Все команды доступны только администратору.
 """
@@ -642,6 +643,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
+        [InlineKeyboardButton("🛣️ Тунель", callback_data='send_ipp')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -1273,6 +1275,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
+        
+    elif data == 'send_ipp':
+    ipp_path = "/etc/openvpn/ipp.txt"
+    if os.path.exists(ipp_path):
+        with open(ipp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f),
+                filename="ipp.txt"
+            )
+        await query.edit_message_text("Файл ipp.txt отправлен.", reply_markup=get_main_keyboard())
+    else:
+        await query.edit_message_text("Файл ipp.txt не найден.", reply_markup=get_main_keyboard())    
 
     elif data == 'help':
         msgs = split_message(HELP_TEXT)
