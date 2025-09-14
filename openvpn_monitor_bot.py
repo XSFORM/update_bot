@@ -900,7 +900,37 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.clear()
         return
 
-# ---------- Renew (оставлен без изменений) ----------
+# ---------- Renew: запрос списка и выбор клиента ----------
+async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Нет доступа", show_alert=True)
+        return
+    await q.answer()
+    files = sorted(get_ovpn_files())
+    if not files:
+        await q.edit_message_text("Нет ключей.", reply_markup=get_main_keyboard())
+        return
+    keyboard = []
+    for i, fname in enumerate(files, 1):
+        name = fname[:-5] if fname.endswith(".ovpn") else fname
+        keyboard.append([InlineKeyboardButton(f"{i}. {name}", callback_data=f"renew_{name}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
+    await q.edit_message_text("Выберите ключ для продления:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Нет доступа", show_alert=True)
+        return
+    await q.answer()
+    data = q.data  # renew_<name>
+    key_name = data.split('_', 1)[1]
+    context.user_data['renew_key_name'] = key_name
+    context.user_data['await_renew_expiry'] = True
+    await q.edit_message_text(f"Введите сколько дней добавить к {key_name}:")
+
+# ---------- Renew (продление сертификата без смены ключа) ----------
 async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('await_renew_expiry'):
         return
@@ -917,8 +947,6 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     # Определяем старую дату окончания
-    from OpenSSL import crypto
-    from datetime import datetime, timedelta
     with open(cert_path, "rb") as f:
         cert_data = f.read()
         cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
@@ -1450,12 +1478,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(ipp_path):
             with open(ipp_path, "rb") as f:
                 await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename="ipp.txt")
-            await q.edit_message_text("ipp.txt отправлен.", reply_markup=get_main_keyboard())
+            await q.edit_message_text("ипп.txt отправлен.", reply_markup=get_main_keyboard())
         else:
             await q.edit_message_text("ipp.txt не найден.", reply_markup=get_main_keyboard())
 
     elif data == 'help':
         await q.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+    elif data == 'log':
+        await log_request(update, context)
 
     # Backup / Restore
     elif data == 'backup_menu':
