@@ -737,7 +737,7 @@ async def process_bulk_disable_numbers(update: Update, context: ContextTypes.DEF
         preview += f"\n... ещё {len(selected)-30}"
     await update.message.reply_text(
         f"<b>Отключить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML,
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Да", callback_data="bulk_disable_confirm")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]
