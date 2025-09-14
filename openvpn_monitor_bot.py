@@ -901,61 +901,49 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
 # ---------- Renew (оставлен без изменений) ----------
-async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    files = get_ovpn_files()
-    if not files:
-        await update.callback_query.edit_message_text("Нет ключей.", reply_markup=get_main_keyboard())
-        return
-    keyboard = []
-    for i, fname in enumerate(sorted(files), 1):
-        keyboard.append([InlineKeyboardButton(f"{i}. {fname[:-5]}", callback_data=f"renew_{fname}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    await update.callback_query.edit_message_text("Выберите ключ:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    fname = query.data.split('_', 1)[1]
-    key_name = fname[:-5] if fname.endswith('.ovpn') else fname
-    context.user_data['renew_key_name'] = key_name
-    context.user_data['await_renew_expiry'] = True
-    await query.edit_message_text(f"Введите сколько дней добавить к {key_name}:")
-
 async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('await_renew_expiry'):
         return
     key_name = context.user_data['renew_key_name']
     cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
-    key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
-    req_path = f"{EASYRSA_DIR}/pki/reqs/{key_name}.req"
     if not os.path.exists(cert_path):
         await update.message.reply_text("Сертификат не найден.")
         context.user_data.clear()
         return
     try:
         days_to_add = int(update.message.text.strip())
-    except:
+    except Exception:
         await update.message.reply_text("Некорректное число.")
         return
+
+    # Определяем старую дату окончания
+    from OpenSSL import crypto
+    from datetime import datetime, timedelta
     with open(cert_path, "rb") as f:
         cert_data = f.read()
         cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
         expiry_old = datetime.strptime(cert.get_notAfter().decode("ascii"), "%Y%m%d%H%M%SZ")
+
     new_expiry_date = expiry_old + timedelta(days=days_to_add)
-    total_days = (new_expiry_date - datetime.utcnow()).days
-    for p in [cert_path, key_path, req_path]:
-        if os.path.exists(p):
-            os.remove(p)
+    days_total = (new_expiry_date - datetime.utcnow()).days
+    if days_total < 1:
+        await update.message.reply_text("Срок действия не может быть в прошлом.")
+        context.user_data.clear()
+        return
+
+    # Продлеваем сертификат через easyrsa renew (НЕ трогаем .key/.req)
     try:
         subprocess.run(
-            f"EASYRSA_CERT_EXPIRE={total_days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
+            f"EASYRSA_CERT_EXPIRE={days_total} {EASYRSA_DIR}/easyrsa --batch renew {key_name}",
             shell=True, check=True, cwd=EASYRSA_DIR
         )
     except subprocess.CalledProcessError as e:
-        await update.message.reply_text(f"Ошибка обновления: {e}")
+        await update.message.reply_text(f"Ошибка продления: {e}")
         context.user_data.clear()
         return
+
     ovpn_path = generate_ovpn_for_client(key_name)
-    await update.message.reply_text(f"Обновлено. Новый общий срок: {total_days} дней.")
+    await update.message.reply_text(f"Срок действия ключа {key_name} продлён на {days_to_add} дней. Новый общий срок: {days_total} дней. Старый .ovpn можно использовать.")
     with open(ovpn_path, "rb") as f:
         await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=f"{key_name}.ovpn")
     context.user_data.clear()
