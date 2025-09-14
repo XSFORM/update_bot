@@ -41,7 +41,7 @@ from backup_restore import (
 )
 
 # -------- Версия / обновление --------
-BOT_VERSION = "2025-09-12-bulkselect2"
+BOT_VERSION = "2025-09-14-telegraph-renew"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -737,7 +737,7 @@ async def process_bulk_disable_numbers(update: Update, context: ContextTypes.DEF
         preview += f"\n... ещё {len(selected)-30}"
     await update.message.reply_text(
         f"<b>Отключить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
+        parse_mode="HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Да", callback_data="bulk_disable_confirm")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]
@@ -776,8 +776,9 @@ HELP_TEXT = f"""
  - Отправка: 📤 → ввод номеров → файлы приходят
  - Включить: ✅ → (заблокированные) ввод номеров
  - Отключить: ⚠️ → (активные) ввод номеров
+ - Обновление ключа: ⌛ → открывается список в Telegraph → введи номер → затем введи на сколько дней продлить
 
-Форматы: all | 1 | 1,2,5 | 3-7 | 1,2,5-9 (пробелы/запятые допустимы, диапазоны a-b)
+Форматы для выбора: all | 1 | 1,2,5 | 3-7 | 1,2,5-9 (пробелы/запятые допустимы, диапазоны a-b)
 """
 
 # ---------- MAIN KEYBOARD ----------
@@ -900,24 +901,73 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.clear()
         return
 
-# ---------- Renew: запрос списка и выбор клиента ----------
+# ---------- Renew через Telegraph: выбор по номеру ----------
 async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
         await q.answer("Нет доступа", show_alert=True)
         return
     await q.answer()
-    files = sorted(get_ovpn_files())
-    if not files:
+    rows = gather_key_metadata()
+    if not rows:
         await q.edit_message_text("Нет ключей.", reply_markup=get_main_keyboard())
         return
-    keyboard = []
-    for i, fname in enumerate(files, 1):
-        name = fname[:-5] if fname.endswith(".ovpn") else fname
-        keyboard.append([InlineKeyboardButton(f"{i}. {name}", callback_data=f"renew_{name}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    await q.edit_message_text("Выберите ключ для продления:", reply_markup=InlineKeyboardMarkup(keyboard))
+    url = create_keys_detailed_page()
+    if not url:
+        await q.edit_message_text("Ошибка Telegraph.", reply_markup=get_main_keyboard())
+        return
+    order = [r["name"] for r in rows]
+    context.user_data['renew_keys_order'] = order
+    context.user_data['await_renew_number'] = True
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_renew")],
+        [InlineKeyboardButton("⬅️ Меню", callback_data="home")]
+    ])
+    await q.edit_message_text(
+        f"<b>Продлить срок ключа</b>\n"
+        f"Открой список и введи номер одного клиента:\n"
+        f"<a href=\"{url}\">Полный список (Telegraph)</a>\n\n"
+        f"Пример: 5",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
+async def process_renew_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_renew_number'):
+        return
+    text = update.message.text.strip()
+    if not re.fullmatch(r"\d+", text):
+        await update.message.reply_text("Нужно ввести один номер клиента (целое число).",
+                                        reply_markup=InlineKeyboardMarkup([
+                                            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_renew")]
+                                        ]))
+        return
+    idx = int(text)
+    order: List[str] = context.user_data.get('renew_keys_order', [])
+    if not order:
+        await update.message.reply_text("Список потерян. Начните заново.", reply_markup=get_main_keyboard())
+        context.user_data.pop('await_renew_number', None)
+        return
+    if idx < 1 or idx > len(order):
+        await update.message.reply_text(f"Номер вне диапазона 1..{len(order)}.",
+                                        reply_markup=InlineKeyboardMarkup([
+                                            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_renew")]
+                                        ]))
+        return
+    key_name = order[idx - 1]
+    context.user_data['renew_key_name'] = key_name
+    context.user_data['await_renew_number'] = False
+    context.user_data['await_renew_expiry'] = True
+    await update.message.reply_text(f"Введите сколько дней добавить к {key_name}:")
+
+async def renew_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Отменено")
+    for k in ['await_renew_number', 'await_renew_expiry', 'renew_keys_order', 'renew_key_name']:
+        context.user_data.pop(k, None)
+    await q.edit_message_text("Обновление сертификата отменено.", reply_markup=get_main_keyboard())
+
+# Оставляем поддержку старого пути (если где-то остались кнопки renew_<name>)
 async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
@@ -1323,11 +1373,16 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     if context.user_data.get('await_bulk_disable_numbers'):
         await process_bulk_disable_numbers(update, context)
         return
-    if context.user_data.get('await_key_name') or context.user_data.get('await_key_expiry'):
-        await create_key_handler(update, context)
+    # Renew: сначала выбор номера, потом количество дней
+    if context.user_data.get('await_renew_number'):
+        await process_renew_number(update, context)
         return
     if context.user_data.get('await_renew_expiry'):
         await renew_key_expiry_handler(update, context)
+        return
+    # Создание ключа
+    if context.user_data.get('await_key_name') or context.user_data.get('await_key_expiry'):
+        await create_key_handler(update, context)
         return
     await update.message.reply_text("Неизвестный ввод. Используй меню.", reply_markup=get_main_keyboard())
 
@@ -1424,7 +1479,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Отменено.", reply_markup=get_main_keyboard())
 
     elif data == 'update_remote':
-        # (оставлен прежний функционал если нужен — можно добавить позже)
         await q.edit_message_text("Функция массового обновления remote перенесена (в предыдущих версиях).", reply_markup=get_main_keyboard())
 
     # Renew
@@ -1432,6 +1486,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
         await renew_key_select_handler(update, context)
+    elif data == 'cancel_renew':
+        await renew_cancel(update, context)
 
     # Bulk Delete
     elif data == 'bulk_delete_start':
@@ -1478,7 +1534,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(ipp_path):
             with open(ipp_path, "rb") as f:
                 await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename="ipp.txt")
-            await q.edit_message_text("ипп.txt отправлен.", reply_markup=get_main_keyboard())
+            await q.edit_message_text("ipp.txt отправлен.", reply_markup=get_main_keyboard())
         else:
             await q.edit_message_text("ipp.txt не найден.", reply_markup=get_main_keyboard())
 
