@@ -416,49 +416,52 @@ def remove_client_files(name: str):
         except Exception as e:
             print(f"[delete] cannot remove {p}: {e}")
 
-# ---------- Утилиты бэкапа: временно исключить архивы из /root ----------
-# === REPLACE this whole block: "_temporarily_move_root_archives", "_restore_moved_archives", "create_backup_ignoring_root_archives" ===
-EXCLUDE_TEMP_DIR = "/root/monitor_bot/.excluded_root_archives"
+# ---------- Утилиты бэкапа: временно исключить архивы/каталоги из /root ----------
+# Храним временно вне /root, чтобы точно не попали в архив
+EXCLUDE_TEMP_DIR = "/tmp/._exclude_root_archives"
 
-def _temporarily_hide_backup_targets() -> List[Tuple[str, str, str]]:
+def _temporarily_hide_root_backup_stuff() -> List[Tuple[str, str, str]]:
     """
-    Прячет на время создания бэкапа:
-      - одиночные архивы /root/*.tar.gz /root/*.tgz
-      - весь каталог BACKUP_OUTPUT_DIR (например, /root/backups)
-    Возвращает список перемещённых объектов для последующего восстановления.
+    Временно прячем из /root перед бэкапом:
+      - все /root/*.tar.gz и /root/*.tgz
+      - каталог /root/backups (если остался от старых версий)
+    Возвращаем список перемещённых объектов (kind, original, temp), чтобы восстановить.
     """
     os.makedirs(EXCLUDE_TEMP_DIR, exist_ok=True)
     moved: List[Tuple[str, str, str]] = []
 
     # 1) Спрятать одиночные архивы в /root
-    patterns = ["/root/*.tar.gz", "/root/*.tgz"]
-    for pattern in patterns:
+    for pattern in ("/root/*.tar.gz", "/root/*.tgz"):
         for src in glob.glob(pattern):
             dst = os.path.join(EXCLUDE_TEMP_DIR, os.path.basename(src))
             try:
-                shutil.move(src, dst)
-                moved.append(("file", src, dst))
+                if os.path.abspath(src) != os.path.abspath(dst):
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    shutil.move(src, dst)
+                    moved.append(("file", src, dst))
             except Exception as e:
                 print(f"[backup exclude] cannot move {src}: {e}")
 
-    # 2) Спрятать весь каталог с бэкапами (например, /root/backups)
-    try:
-        if os.path.isdir(BACKUP_OUTPUT_DIR):
-            dst_dir = os.path.join(EXCLUDE_TEMP_DIR, "__BACKUPS_DIR__")
+    # 2) Спрятать каталог /root/backups, если существует
+    backups_dir = "/root/backups"
+    if os.path.isdir(backups_dir):
+        dst_dir = os.path.join(EXCLUDE_TEMP_DIR, "__backups_dir__")
+        try:
             if os.path.exists(dst_dir):
                 shutil.rmtree(dst_dir, ignore_errors=True)
-            shutil.move(BACKUP_OUTPUT_DIR, dst_dir)
-            moved.append(("dir", BACKUP_OUTPUT_DIR, dst_dir))
-    except Exception as e:
-        print(f"[backup exclude] cannot move BACKUP_OUTPUT_DIR '{BACKUP_OUTPUT_DIR}': {e}")
+            shutil.move(backups_dir, dst_dir)
+            moved.append(("dir", backups_dir, dst_dir))
+        except Exception as e:
+            print(f"[backup exclude] cannot move {backups_dir}: {e}")
 
     return moved
 
-def _restore_hidden_backup_targets(moved: List[Tuple[str, str, str]]):
+def _restore_hidden_root_backup_stuff(moved: List[Tuple[str, str, str]]):
     # Восстанавливаем в обратном порядке
     for kind, src, dst in reversed(moved):
         try:
-            # Если на исходном месте уже что-то появилось, удалим временное
+            # Если на исходном месте уже что-то появилось, удалим временную копию
             if os.path.exists(src):
                 if kind == "dir":
                     shutil.rmtree(dst, ignore_errors=True)
@@ -466,17 +469,38 @@ def _restore_hidden_backup_targets(moved: List[Tuple[str, str, str]]):
                     if os.path.exists(dst):
                         os.remove(dst)
                 continue
-            shutil.move(dst, src)
+            # Иначе вернём обратно
+            if os.path.exists(dst):
+                # Убедимся, что родитель существует
+                os.makedirs(os.path.dirname(src), exist_ok=True)
+                shutil.move(dst, src)
         except Exception as e:
             print(f"[backup exclude] cannot restore {src} from {dst}: {e}")
 
-def create_backup_ignoring_root_archives() -> str:
-    moved = _temporarily_hide_backup_targets()
+def create_backup_in_root_excluding_archives() -> str:
+    """
+    Создаёт бэкап, гарантируя:
+      - в архив НЕ попадут /root/*.tar.gz, /root/*.tgz и /root/backups
+      - итоговый архив лежит в /root
+    """
+    moved = _temporarily_hide_root_backup_stuff()
     try:
-        path = br_create_backup()
-        return path
+        path = br_create_backup()  # может создать в любом месте (зависит от backup_restore)
+        if not path or not os.path.exists(path):
+            raise RuntimeError("Backup creation failed (no path returned)")
+
+        # Перенос в /root, если нужно
+        dest = os.path.join("/root", os.path.basename(path))
+        if os.path.abspath(path) != os.path.abspath(dest):
+            if os.path.exists(dest):
+                os.remove(dest)
+            shutil.move(path, dest)
+        else:
+            dest = path
+
+        return dest
     finally:
-        _restore_hidden_backup_targets(moved)
+        _restore_hidden_root_backup_stuff(moved)
 
 # ---------- Массовое удаление ----------
 async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1138,19 +1162,14 @@ def get_status_log_tail(n=40):
 
 # ---------- BACKUP / RESTORE UI ----------
 def list_backups() -> List[str]:
-    if not os.path.exists(BACKUP_OUTPUT_DIR):
-        return []
-    items = []
-    for fn in os.listdir(BACKUP_OUTPUT_DIR):
-        if fn.startswith("openvpn_full_backup_") and fn.endswith(".tar.gz"):
-            items.append(fn)
+    items = [os.path.basename(p) for p in glob.glob("/root/openvpn_full_backup_*.tar.gz")]
     return sorted(items, reverse=True)
 
 async def perform_backup_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     try:
-        path = create_backup_ignoring_root_archives()
+        path = create_backup_in_root_excluding_archives()
         size = os.path.getsize(path)
         await update.callback_query.edit_message_text(
             f"✅ Бэкап создан: <code>{os.path.basename(path)}</code>\nРазмер: {size/1024/1024:.2f} MB",
@@ -1165,7 +1184,7 @@ async def perform_backup_and_send(update: Update, context: ContextTypes.DEFAULT_
         await update.callback_query.edit_message_text(f"Ошибка бэкапа: {e}", reply_markup=get_main_keyboard())
 
 async def send_backup_file(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join(BACKUP_OUTPUT_DIR, fname)
+    full = os.path.join("/root", fname)
     if not os.path.exists(full):
         await update.callback_query.edit_message_text("Файл не найден.", reply_markup=get_main_keyboard())
         return
@@ -1185,7 +1204,7 @@ async def show_backup_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("Список бэкапов:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_backup_info(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join(BACKUP_OUTPUT_DIR, fname)
+    full = os.path.join("/root", fname)
     staging = f"/tmp/info_{int(time.time())}"
     os.makedirs(staging, exist_ok=True)
     try:
@@ -1215,7 +1234,7 @@ async def show_backup_info(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         shutil.rmtree(staging, ignore_errors=True)
 
 async def restore_dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join(BACKUP_OUTPUT_DIR, fname)
+    full = os.path.join("/root", fname)
     try:
         report = apply_restore(full, dry_run=True)
         diff = report["diff"]
@@ -1257,13 +1276,8 @@ async def restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fnam
 # ----- Удаление бэкапа -----
 # === REPLACE the functions backup_delete_prompt(...) and backup_delete_apply(...) with: ===
 async def backup_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    # Попробуем в каталоге бэкапов; на всякий случай проверим и /root
-    candidates = [
-        os.path.join(BACKUP_OUTPUT_DIR, fname),
-        os.path.join("/root", fname),
-    ]
-    target = next((p for p in candidates if os.path.exists(p)), "")
-    if not target:
+    full = os.path.join("/root", fname)
+    if not os.path.exists(full):
         await update.callback_query.edit_message_text("Файл не найден.", reply_markup=get_main_keyboard())
         return
     kb = InlineKeyboardMarkup([
@@ -1275,24 +1289,16 @@ async def backup_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def backup_delete_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    errors = []
-    deleted_any = False
-    for base in (BACKUP_OUTPUT_DIR, "/root"):
-        full = os.path.join(base, fname)
-        try:
-            if os.path.exists(full):
-                os.remove(full)
-                deleted_any = True
-        except Exception as e:
-            errors.append(f"{full}: {e}")
-    if deleted_any and not errors:
-        await update.callback_query.edit_message_text("🗑️ Бэкап удалён.", reply_markup=get_main_keyboard())
-        # Показать обновлённый список
-        await show_backup_list(update, context)
-    elif deleted_any and errors:
-        await update.callback_query.edit_message_text("Удалён, но были ошибки:\n" + "\n".join(errors), reply_markup=get_main_keyboard())
-    else:
-        await update.callback_query.edit_message_text("Файл не найден.", reply_markup=get_main_keyboard())
+    full = os.path.join("/root", fname)
+    try:
+        if os.path.exists(full):
+            os.remove(full)
+            await update.callback_query.edit_message_text("🗑️ Бэкап удалён.", reply_markup=get_main_keyboard())
+            await show_backup_list(update, context)
+        else:
+            await update.callback_query.edit_message_text("Файл не найден.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        await update.callback_query.edit_message_text(f"Ошибка удаления: {e}", reply_markup=get_main_keyboard())
 
 async def backup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1730,7 +1736,7 @@ async def cmd_backup_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     try:
-        path = create_backup_ignoring_root_archives()
+        path = create_backup_in_root_excluding_archives()
         await update.message.reply_text(f"✅ Бэкап: {os.path.basename(path)}", reply_markup=get_main_keyboard())
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}", reply_markup=get_main_keyboard())
