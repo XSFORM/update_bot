@@ -41,7 +41,7 @@ from backup_restore import (
 )
 
 # -------- Версия / обновление --------
-BOT_VERSION = "2025-09-14-telegraph-renew"
+BOT_VERSION = "2025-09-17-clean-pem-renew-toggle"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -59,6 +59,14 @@ OPENVPN_DIR = "/etc/openvpn"
 EASYRSA_DIR = "/etc/openvpn/easy-rsa"
 STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
+
+# Режимы продления:
+# Если вы реально используете X.509 сроки годности сертификата, клиенту нужен новый .ovpn после renew.
+# Тогда установите SEND_NEW_OVPN_ON_RENEW = True.
+# Если же "срок" реализован серверной логикой (например, блок через CCD и разблок при "продлении"),
+# и сертификаты вы делаете длинные (или не полагаетесь на их истечение) — можно оставить False,
+# чтобы не пересоздавать и не рассылать .ovpn.
+SEND_NEW_OVPN_ON_RENEW = False
 
 TM_TZ = pytz.timezone("Asia/Ashgabat")
 MGMT_SOCKET = "/var/run/openvpn.sock"
@@ -313,7 +321,7 @@ def create_telegraph_pre_page(title: str, text: str) -> Optional[str]:
         print(f"[telegraph] create page error: {e}")
         return None
 
-def create_keys_detailed_page() -> Optional[str]:
+def create_keys_detailed_page():
     rows = gather_key_metadata()
     if not rows:
         return None
@@ -404,6 +412,7 @@ def remove_client_files(name: str):
         except Exception as e:
             print(f"[delete] cannot remove {p}: {e}")
 
+# ---------- Массовое удаление ----------
 async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -676,7 +685,7 @@ async def bulk_enable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.pop(k, None)
     await q.edit_message_text(f"✅ Включено клиентов: {done}", reply_markup=get_main_keyboard())
 
-async def bulk_enable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bulk_enable_cancel(update: Update, Context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Отменено")
     for k in ['bulk_enable_selected', 'bulk_enable_keys', 'await_bulk_enable_numbers']:
@@ -808,6 +817,23 @@ def get_main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 # ---------- Генерация OVPN / создание / обновление ----------
+def extract_pem_cert(cert_path: str) -> str:
+    """
+    Возвращает только PEM-блок сертификата из файла (без текстового вывода openssl -text).
+    """
+    with open(cert_path, "r") as f:
+        lines = f.read().splitlines()
+    in_pem = False
+    pem_lines = []
+    for line in lines:
+        if "-----BEGIN CERTIFICATE-----" in line:
+            in_pem = True
+        if in_pem:
+            pem_lines.append(line)
+        if "-----END CERTIFICATE-----" in line:
+            break
+    return "\n".join(pem_lines).strip()
+
 def generate_ovpn_for_client(
     client_name,
     output_dir=KEYS_DIR,
@@ -835,13 +861,12 @@ def generate_ovpn_for_client(
                 TLS_SIG = 2
 
     with open(template_path, "r") as f:
-        template_content = f.read()
+        template_content = f.read().rstrip()
     with open(ca_path, "r") as f:
-        ca_content = f.read()
-    with open(cert_path, "r") as f:
-        cert_content = f.read()
+        ca_content = f.read().strip()
+    cert_content = extract_pem_cert(cert_path)
     with open(key_path, "r") as f:
-        key_content = f.read()
+        key_content = f.read().strip()
 
     content = template_content + "\n"
     content += "<ca>\n" + ca_content + "\n</ca>\n"
@@ -850,12 +875,12 @@ def generate_ovpn_for_client(
 
     if TLS_SIG == 1 and os.path.exists(tls_crypt_path):
         with open(tls_crypt_path, "r") as f:
-            tls_crypt_content = f.read()
+            tls_crypt_content = f.read().strip()
         content += "<tls-crypt>\n" + tls_crypt_content + "\n</tls-crypt>\n"
     elif TLS_SIG == 2 and os.path.exists(tls_auth_path):
         content += "key-direction 1\n"
         with open(tls_auth_path, "r") as f:
-            tls_auth_content = f.read()
+            tls_auth_content = f.read().strip()
         content += "<tls-auth>\n" + tls_auth_content + "\n</tls-auth>\n"
 
     with open(ovpn_file, "w") as f:
@@ -1020,10 +1045,21 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
         context.user_data.clear()
         return
 
-    ovpn_path = generate_ovpn_for_client(key_name)
-    await update.message.reply_text(f"Срок действия ключа {key_name} продлён на {days_to_add} дней. Новый общий срок: {days_total} дней. Старый .ovpn можно использовать.")
-    with open(ovpn_path, "rb") as f:
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=f"{key_name}.ovpn")
+    if SEND_NEW_OVPN_ON_RENEW:
+        # Для реального контроля по X.509: клиенту нужен обновлённый .ovpn
+        ovpn_path = generate_ovpn_for_client(key_name)
+        await update.message.reply_text(
+            f"Срок действия ключа {key_name} продлён на {days_to_add} дней. Новый общий срок: {days_total} дней."
+        )
+        with open(ovpn_path, "rb") as f:
+            await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=f"{key_name}.ovpn")
+    else:
+        # Серверная модель контроля доступа (CCD/скрипт) — файл менять не нужно
+        await update.message.reply_text(
+            f"Срок действия ключа {key_name} продлён на {days_to_add} дней. "
+            f"Старый .ovpn будет работать, менять файл не нужно."
+        )
+
     context.user_data.clear()
 
 # ---------- Лог ----------
