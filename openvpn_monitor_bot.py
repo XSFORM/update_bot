@@ -8,6 +8,10 @@ OpenVPN Telegram Monitor Bot
  - Массовое включение заблокированных клиентов (multi-select)
  - Массовое отключение активных клиентов (multi-select)
  - Все списки показываются через Telegraph (таблица или список), ввод одной строкой.
+ - Чистый PEM в <cert> без мусора при генерации .ovpn
+ - Продление: опция не пересоздавать .ovpn (SEND_NEW_OVPN_ON_RENEW = False)
+ - Бэкап: игнорируются архивы *.tar.gz / *.tgz из /root (чтобы бэкап не раздувался)
+ - Меню бэкапов: добавлено удаление бэкапа (с подтверждением)
 """
 
 import os
@@ -21,6 +25,7 @@ import math
 import traceback
 import re
 import requests
+import shutil
 
 from OpenSSL import crypto
 import pytz
@@ -41,7 +46,7 @@ from backup_restore import (
 )
 
 # -------- Версия / обновление --------
-BOT_VERSION = "2025-09-17-clean-pem-renew-toggle"
+BOT_VERSION = "2025-09-17-bak-exclude-delete"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -60,12 +65,7 @@ EASYRSA_DIR = "/etc/openvpn/easy-rsa"
 STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
 
-# Режимы продления:
-# Если вы реально используете X.509 сроки годности сертификата, клиенту нужен новый .ovpn после renew.
-# Тогда установите SEND_NEW_OVPN_ON_RENEW = True.
-# Если же "срок" реализован серверной логикой (например, блок через CCD и разблок при "продлении"),
-# и сертификаты вы делаете длинные (или не полагаетесь на их истечение) — можно оставить False,
-# чтобы не пересоздавать и не рассылать .ovpn.
+# Режимы продления (см. комментарии в renew)
 SEND_NEW_OVPN_ON_RENEW = False
 
 TM_TZ = pytz.timezone("Asia/Ashgabat")
@@ -83,6 +83,10 @@ traffic_usage: Dict[str, Dict[str, int]] = {}
 _last_session_state = {}
 _last_traffic_save_time = 0
 TRAFFIC_SAVE_INTERVAL = 60
+
+# Глоб для исключения архивов из /root при бэкапе
+ROOT_ARCHIVE_EXCLUDE_GLOBS = ["/root/*.tar.gz", "/root/*.tgz"]
+EXCLUDE_TEMP_DIR = "/root/monitor_bot/.excluded_root_archives"
 
 # Пагинация (пока оставлена для stats текста, но не для выборов)
 PAGE_SIZE_KEYS = 40
@@ -412,6 +416,37 @@ def remove_client_files(name: str):
         except Exception as e:
             print(f"[delete] cannot remove {p}: {e}")
 
+# ---------- Утилиты бэкапа: временно исключить архивы из /root ----------
+def _temporarily_move_root_archives() -> List[Tuple[str, str]]:
+    os.makedirs(EXCLUDE_TEMP_DIR, exist_ok=True)
+    moved: List[Tuple[str, str]] = []
+    for pattern in ROOT_ARCHIVE_EXCLUDE_GLOBS:
+        for src in glob.glob(pattern):
+            dst = os.path.join(EXCLUDE_TEMP_DIR, os.path.basename(src))
+            try:
+                shutil.move(src, dst)
+                moved.append((src, dst))
+            except Exception as e:
+                print(f"[backup exclude] cannot move {src}: {e}")
+    return moved
+
+def _restore_moved_archives(moved: List[Tuple[str, str]]):
+    for src, dst in moved:
+        # src — оригинальный путь, dst — где лежит сейчас (temp)
+        try:
+            if os.path.exists(dst):
+                shutil.move(dst, src)
+        except Exception as e:
+            print(f"[backup exclude] cannot restore {src} from {dst}: {e}")
+
+def create_backup_ignoring_root_archives() -> str:
+    moved = _temporarily_move_root_archives()
+    try:
+        path = br_create_backup()
+        return path
+    finally:
+        _restore_moved_archives(moved)
+
 # ---------- Массовое удаление ----------
 async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -685,7 +720,7 @@ async def bulk_enable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.pop(k, None)
     await q.edit_message_text(f"✅ Включено клиентов: {done}", reply_markup=get_main_keyboard())
 
-async def bulk_enable_cancel(update: Update, Context: ContextTypes.DEFAULT_TYPE):
+async def bulk_enable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Отменено")
     for k in ['bulk_enable_selected', 'bulk_enable_keys', 'await_bulk_enable_numbers']:
@@ -787,6 +822,10 @@ HELP_TEXT = f"""
  - Отключить: ⚠️ → (активные) ввод номеров
  - Обновление ключа: ⌛ → открывается список в Telegraph → введи номер → затем введи на сколько дней продлить
 
+Прочее:
+ - Бэкап игнорирует *.tar.gz / *.tgz в /root (архивы бэкапов не попадают в новые бэкапы)
+ - В меню бэкапов можно удалить выбранный архив
+
 Форматы для выбора: all | 1 | 1,2,5 | 3-7 | 1,2,5-9 (пробелы/запятые допустимы, диапазоны a-b)
 """
 
@@ -818,9 +857,6 @@ def get_main_keyboard():
 
 # ---------- Генерация OVPN / создание / обновление ----------
 def extract_pem_cert(cert_path: str) -> str:
-    """
-    Возвращает только PEM-блок сертификата из файла (без текстового вывода openssl -text).
-    """
     with open(cert_path, "r") as f:
         lines = f.read().splitlines()
     in_pem = False
@@ -1046,7 +1082,6 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     if SEND_NEW_OVPN_ON_RENEW:
-        # Для реального контроля по X.509: клиенту нужен обновлённый .ovpn
         ovpn_path = generate_ovpn_for_client(key_name)
         await update.message.reply_text(
             f"Срок действия ключа {key_name} продлён на {days_to_add} дней. Новый общий срок: {days_total} дней."
@@ -1054,7 +1089,6 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
         with open(ovpn_path, "rb") as f:
             await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=f"{key_name}.ovpn")
     else:
-        # Серверная модель контроля доступа (CCD/скрипт) — файл менять не нужно
         await update.message.reply_text(
             f"Срок действия ключа {key_name} продлён на {days_to_add} дней. "
             f"Старый .ovpn будет работать, менять файл не нужно."
@@ -1085,7 +1119,7 @@ async def perform_backup_and_send(update: Update, context: ContextTypes.DEFAULT_
     if update.effective_user.id != ADMIN_ID:
         return
     try:
-        path = br_create_backup()
+        path = create_backup_ignoring_root_archives()
         size = os.path.getsize(path)
         await update.callback_query.edit_message_text(
             f"✅ Бэкап создан: <code>{os.path.basename(path)}</code>\nРазмер: {size/1024/1024:.2f} MB",
@@ -1142,11 +1176,11 @@ async def show_backup_info(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🧪 Diff", callback_data=f"restore_dry_{fname}")],
             [InlineKeyboardButton("📤 Отправить", callback_data=f"backup_send_{fname}")],
+            [InlineKeyboardButton("🗑️ Удалить", callback_data=f"backup_delete_{fname}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="backup_list")]
         ])
         await update.callback_query.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
     finally:
-        import shutil
         shutil.rmtree(staging, ignore_errors=True)
 
 async def restore_dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
@@ -1188,6 +1222,31 @@ async def restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fnam
     except Exception as e:
         tb = traceback.format_exc()
         await update.callback_query.edit_message_text(f"Ошибка restore: {e}\n<pre>{tb[-800:]}</pre>", parse_mode="HTML")
+
+# ----- Удаление бэкапа -----
+async def backup_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
+    full = os.path.join(BACKUP_OUTPUT_DIR, fname)
+    if not os.path.exists(full):
+        await update.callback_query.edit_message_text("Файл не найден.", reply_markup=get_main_keyboard())
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"backup_delete_confirm_{fname}")],
+        [InlineKeyboardButton("❌ Нет", callback_data=f"backup_info_{fname}")]
+    ])
+    await update.callback_query.edit_message_text(
+        f"Удалить бэкап <b>{fname}</b>?", parse_mode="HTML", reply_markup=kb
+    )
+
+async def backup_delete_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
+    full = os.path.join(BACKUP_OUTPUT_DIR, fname)
+    try:
+        if os.path.exists(full):
+            os.remove(full)
+        await update.callback_query.edit_message_text("🗑️ Бэкап удалён.", reply_markup=get_main_keyboard())
+        # Показать обновлённый список
+        await show_backup_list(update, context)
+    except Exception as e:
+        await update.callback_query.edit_message_text(f"Ошибка удаления: {e}", reply_markup=get_main_keyboard())
 
 async def backup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1486,7 +1545,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'stats':
         clients, online_names, tunnel_ips = parse_openvpn_status()
-        # компактный статус всех
         files = get_ovpn_files()
         lines = ["<b>Статус всех ключей:</b>"]
         for f in sorted(files):
@@ -1524,6 +1582,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await renew_key_select_handler(update, context)
     elif data == 'cancel_renew':
         await renew_cancel(update, context)
+
+    # Backup / Restore меню
+    elif data == 'backup_menu':
+        await backup_menu(update, context)
+    elif data == 'backup_create':
+        await perform_backup_and_send(update, context)
+    elif data == 'backup_list':
+        await show_backup_list(update, context)
+    elif data.startswith('backup_info_'):
+        fname = data.replace('backup_info_', '', 1)
+        await show_backup_info(update, context, fname)
+    elif data.startswith('backup_send_'):
+        fname = data.replace('backup_send_', '', 1)
+        await send_backup_file(update, context, fname)
+    elif data.startswith('restore_dry_'):
+        fname = data.replace('restore_dry_', '', 1)
+        await restore_dry_run(update, context, fname)
+    elif data.startswith('restore_apply_'):
+        fname = data.replace('restore_apply_', '', 1)
+        await restore_apply(update, context, fname)
+    elif data.startswith('backup_delete_'):
+        fname = data.replace('backup_delete_', '', 1)
+        await backup_delete_prompt(update, context, fname)
+    elif data.startswith('backup_delete_confirm_'):
+        fname = data.replace('backup_delete_confirm_', '', 1)
+        await backup_delete_apply(update, context, fname)
 
     # Bulk Delete
     elif data == 'bulk_delete_start':
@@ -1580,34 +1664,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'log':
         await log_request(update, context)
 
-    # Backup / Restore
-    elif data == 'backup_menu':
-        await backup_menu(update, context)
-    elif data == 'backup_create':
-        await perform_backup_and_send(update, context)
-    elif data == 'backup_list':
-        await show_backup_list(update, context)
-    elif data.startswith('backup_info_'):
-        fname = data.replace('backup_info_', '', 1)
-        await show_backup_info(update, context, fname)
-    elif data.startswith('backup_send_'):
-        fname = data.replace('backup_send_', '', 1)
-        await send_backup_file(update, context, fname)
-    elif data == 'restore_menu':
-        await restore_menu(update, context)
-    elif data.startswith('restore_dry_'):
-        fname = data.replace('restore_dry_', '', 1)
-        await restore_dry_run(update, context, fname)
-    elif data.startswith('restore_apply_'):
-        fname = data.replace('restore_apply_', '', 1)
-        await restore_apply(update, context, fname)
-
-    elif data == 'block_alert':
-        await q.edit_message_text(
-            f"Тревога активна в фоне.\nПорог < {MIN_ONLINE_ALERT}, антиспам {ALERT_INTERVAL_SEC}s.",
-            reply_markup=get_main_keyboard()
-        )
-
     elif data == 'create_key':
         await q.edit_message_text("Введите имя нового клиента:")
         context.user_data['await_key_name'] = True
@@ -1628,7 +1684,7 @@ async def cmd_backup_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     try:
-        path = br_create_backup()
+        path = create_backup_ignoring_root_archives()
         await update.message.reply_text(f"✅ Бэкап: {os.path.basename(path)}", reply_markup=get_main_keyboard())
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}", reply_markup=get_main_keyboard())
