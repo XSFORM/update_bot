@@ -1635,7 +1635,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'cancel_renew':
         await renew_cancel(update, context)
 
-    # Backup / Restore меню
+        # Backup / Restore меню
     elif data == 'backup_menu':
         await backup_menu(update, context)
     elif data == 'backup_create':
@@ -1654,12 +1654,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('restore_apply_'):
         fname = data.replace('restore_apply_', '', 1)
         await restore_apply(update, context, fname)
-    elif data.startswith('backup_delete_'):
-        fname = data.replace('backup_delete_', '', 1)
-        await backup_delete_prompt(update, context, fname)
+    # ВАЖНО: сначала confirm, потом delete
     elif data.startswith('backup_delete_confirm_'):
         fname = data.replace('backup_delete_confirm_', '', 1)
         await backup_delete_apply(update, context, fname)
+    elif data.startswith('backup_delete_'):
+        fname = data.replace('backup_delete_', '', 1)
+        await backup_delete_prompt(update, context, fname)
 
     # Bulk Delete
     elif data == 'bulk_delete_start':
