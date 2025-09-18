@@ -1940,11 +1940,18 @@ async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
+def _html_escape(s: str) -> str:
+    return (s
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
 async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     log_text = get_status_log_tail()
-    msgs = split_message(f"<b>status.log (хвост):</b>\n<pre>{log_text}</pre>")
+    safe = _html_escape(log_text)
+    msgs = split_message(f"<b>status.log (хвост):</b>\n<pre>{safe}</pre>")
     await q.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
     for m in msgs[1:]:
         await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
@@ -1969,9 +1976,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
     data = q.data
-
-    # DEBUG (можно включить при отладке)
-    # print("DEBUG callback_data:", data)
 
     if data == 'refresh':
         await q.edit_message_text(format_clients_by_certs(), parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -2102,10 +2106,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "🔔 Мониторинг блокировки включен.\n"
             f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
-            "Оповещения:\n"
-            " • Все оффлайн\n"
+            "Оповещения, если:\n"
+            " • Все клиенты оффлайн\n"
             " • Онлайн меньше порога\n"
-            "Проверка каждые 10 секунд.\n"
+            "Проверка статуса: каждые 10 секунд.\n"
             "Проверка истечения логических сроков: каждые 12 часов.",
             reply_markup=get_main_keyboard()
         )
@@ -2114,9 +2118,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await q.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
         except Exception as e:
-            # Если редактирование не удалось (например, сообщение слишком старое), отправим новое
             print(f"[help] edit failed: {e}")
-            await context.bot.send_message(chat_id=q.message.chat_id, text=HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+            await context.bot.send_message(chat_id=q.message.chat_id,
+                                           text=HELP_TEXT,
+                                           parse_mode="HTML",
+                                           reply_markup=get_main_keyboard())
 
     elif data == 'log':
         await log_request(update, context)
