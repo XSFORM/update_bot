@@ -1289,6 +1289,7 @@ def build_help_messages():
     if current:
         parts.append(current)
     return parts
+
 def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
