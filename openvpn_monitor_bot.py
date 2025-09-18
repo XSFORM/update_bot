@@ -1970,6 +1970,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
 
+    # DEBUG (можно включить при отладке)
+    # print("DEBUG callback_data:", data)
+
     if data == 'refresh':
         await q.edit_message_text(format_clients_by_certs(), parse_mode="HTML", reply_markup=get_main_keyboard())
 
@@ -1990,15 +1993,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'traffic':
         save_traffic_db(force=True)
         await q.edit_message_text(build_traffic_report(), parse_mode="HTML", reply_markup=get_main_keyboard())
+
     elif data == 'traffic_clear':
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Да", callback_data="confirm_clear_traffic")],
             [InlineKeyboardButton("❌ Нет", callback_data="cancel_clear_traffic")]
         ])
         await q.edit_message_text("Очистить накопленный трафик?", reply_markup=kb)
+
     elif data == 'confirm_clear_traffic':
         clear_traffic_stats()
         await q.edit_message_text("Очищено.", reply_markup=get_main_keyboard())
+
     elif data == 'cancel_clear_traffic':
         await q.edit_message_text("Отменено.", reply_markup=get_main_keyboard())
 
@@ -2092,8 +2098,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.edit_message_text("ipp.txt не найден.", reply_markup=get_main_keyboard())
 
+    elif data == 'block_alert':
+        await q.edit_message_text(
+            "🔔 Мониторинг блокировки включен.\n"
+            f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
+            "Оповещения:\n"
+            " • Все оффлайн\n"
+            " • Онлайн меньше порога\n"
+            "Проверка каждые 10 секунд.\n"
+            "Проверка истечения логических сроков: каждые 12 часов.",
+            reply_markup=get_main_keyboard()
+        )
+
     elif data == 'help':
-        await q.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+        try:
+            await q.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+        except Exception as e:
+            # Если редактирование не удалось (например, сообщение слишком старое), отправим новое
+            print(f"[help] edit failed: {e}")
+            await context.bot.send_message(chat_id=q.message.chat_id, text=HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
 
     elif data == 'log':
         await log_request(update, context)
