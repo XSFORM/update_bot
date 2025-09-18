@@ -1266,19 +1266,13 @@ HELP_TEXT = """❓ Справка (обновлено: логические ср
 Автор / связь: @XS_FORM
 Удачной работы!"""
 
-# ---------- MAIN KEYBOARD ----------
 def build_help_messages():
-    """
-    Возвращает список готовых HTML-сообщений для отправки помощи.
-    Экранируем все < > кроме намеренных тегов (их у нас нет внутри),
-    затем заворачиваем в <pre>. Дробим по 3500 символов, чтобы избежать
-    переполнения при HTML-парсинге.
-    """
+    # Экранируем все < > & чтобы не было BadRequest от Telegram
+    from html import escape
     raw = HELP_TEXT
-    # Экранируем полностью
     esc = escape(raw)
     wrapped = f"<b>Помощь</b>\n<pre>{esc}</pre>"
-    # Разбиваем вручную (split_message уже использует 4000, возьмём запас 3500)
+    # Дробим на части по 3500 символов, чтобы не превышать лимит Telegram
     parts = []
     current = ""
     for line in wrapped.splitlines():
@@ -1289,6 +1283,8 @@ def build_help_messages():
     if current:
         parts.append(current)
     return parts
+
+# ---------- MAIN KEYBOARD ----------
 
 def get_main_keyboard():
     keyboard = [
@@ -1927,8 +1923,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     parts = build_help_messages()
-    # Первое сообщение
     await update.message.reply_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
+    for p in parts[1:]:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=p,
+                                       parse_mode="HTML", reply_markup=get_main_keyboard())
     # Остальные (если есть)
     for p in parts[1:]:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=p, parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -2144,14 +2142,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'help':
+        # Всегда используем экранирование!
         parts = build_help_messages()
+        # Пробуем редактировать, если нельзя — отправляем новое сообщение
         try:
             await q.edit_message_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-        except Exception as e:
-            # если редактирование нельзя – отправим новое сообщение
-            await context.bot.send_message(chat_id=q.message.chat_id, text=parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
+        except Exception:
+            await context.bot.send_message(chat_id=q.message.chat_id, text=parts[0],
+                                           parse_mode="HTML", reply_markup=get_main_keyboard())
         for p in parts[1:]:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=p, parse_mode="HTML", reply_markup=get_main_keyboard())
+            await context.bot.send_message(chat_id=q.message.chat_id, text=p,
+                                           parse_mode="HTML", reply_markup=get_main_keyboard())
 
     elif data == 'log':
         await log_request(update, context)
