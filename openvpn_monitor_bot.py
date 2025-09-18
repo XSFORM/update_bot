@@ -25,6 +25,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict
+from html import escape
 import glob
 import json
 import math
@@ -1266,6 +1267,28 @@ HELP_TEXT = """❓ Справка (обновлено: логические ср
 Удачной работы!"""
 
 # ---------- MAIN KEYBOARD ----------
+def build_help_messages():
+    """
+    Возвращает список готовых HTML-сообщений для отправки помощи.
+    Экранируем все < > кроме намеренных тегов (их у нас нет внутри),
+    затем заворачиваем в <pre>. Дробим по 3500 символов, чтобы избежать
+    переполнения при HTML-парсинге.
+    """
+    raw = HELP_TEXT
+    # Экранируем полностью
+    esc = escape(raw)
+    wrapped = f"<b>Помощь</b>\n<pre>{esc}</pre>"
+    # Разбиваем вручную (split_message уже использует 4000, возьмём запас 3500)
+    parts = []
+    current = ""
+    for line in wrapped.splitlines():
+        if len(current) + len(line) + 1 > 3500:
+            parts.append(current)
+            current = ""
+        current += line + "\n"
+    if current:
+        parts.append(current)
+    return parts
 def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
@@ -1902,7 +1925,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+    parts = build_help_messages()
+    # Первое сообщение
+    await update.message.reply_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
+    # Остальные (если есть)
+    for p in parts[1:]:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=p, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -2114,15 +2142,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
 
-    elif data == 'help':
+        elif data == 'help':
+        parts = build_help_messages()
         try:
-            await q.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+            await q.edit_message_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         except Exception as e:
-            print(f"[help] edit failed: {e}")
-            await context.bot.send_message(chat_id=q.message.chat_id,
-                                           text=HELP_TEXT,
-                                           parse_mode="HTML",
-                                           reply_markup=get_main_keyboard())
+            # если редактирование нельзя – отправим новое сообщение
+            await context.bot.send_message(chat_id=q.message.chat_id, text=parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
+        for p in parts[1:]:
+            await context.bot.send_message(chat_id=q.message.chat_id, text=p, parse_mode="HTML", reply_markup=get_main_keyboard())
 
     elif data == 'log':
         await log_request(update, context)
