@@ -2143,7 +2143,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
 
-        elif data == 'help':
+    elif data == 'help':
         parts = build_help_messages()
         try:
             await q.edit_message_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
