@@ -2142,9 +2142,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'help':
-        # Всегда используем экранирование!
         parts = build_help_messages()
-        # Пробуем редактировать, если нельзя — отправляем новое сообщение
         try:
             await q.edit_message_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         except Exception:
