@@ -271,7 +271,6 @@ def disconnect_client_sessions(client_name: str) -> bool:
             print(f"[mgmt] client-kill {client_name} -> {out.strip()[:120]}")
             return True
     except Exception as e:
-        # print(f"[mgmt] tcp fail: {e}")
         pass
 
     # Unix socket fallback
@@ -362,10 +361,7 @@ def unblock_client_ccd(client_name):
     p = os.path.join(CCD_DIR, client_name)
     with open(p, "w") as f:
         f.write("enable\n")
-    # Можно при необходимости выбить старую сессию (обычно не нужно):
-    # disconnect_client_sessions(client_name)
 
-# СТАРЫЙ fallback (оставляем на случай вызовов из старых участков)
 def kill_openvpn_session(client_name):
     return disconnect_client_sessions(client_name)
 
@@ -620,12 +616,10 @@ def remove_client_files(name: str):
         except Exception as e:
             print(f"[delete] cannot remove {p}: {e}")
 
-    # Удаляем из meta (логический срок)
     if name in client_meta:
         client_meta.pop(name, None)
         save_client_meta()
 
-    # Удаляем трафик
     if name in traffic_usage:
         traffic_usage.pop(name, None)
         save_traffic_db(force=True)
@@ -693,9 +687,8 @@ def create_backup_in_root_excluding_archives() -> str:
         _restore_hidden_root_backup_stuff(moved)
 
 # ================== BULK HANDLERS (ВОССТАНОВЛЕНО) ==================
-# Парсеры номеров мы уже имеем: parse_bulk_selection
+# (Код массовых операций находится далее — без изменений)
 
-# ---------- Массовое УДАЛЕНИЕ ----------
 async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1057,8 +1050,8 @@ async def bulk_disable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
     for k in ['bulk_disable_selected', 'bulk_disable_keys', 'await_bulk_disable_numbers']:
         context.user_data.pop(k, None)
     await q.edit_message_text("Массовое отключение отменено.", reply_markup=get_main_keyboard())
-# ================== /BULK HANDLERS ==================
-# ================== UPDATE REMOTE (добавлено) ==================
+
+# ================== UPDATE REMOTE ==================
 CLIENT_TEMPLATE_CANDIDATES = [
     "/etc/openvpn/client-template.txt",
     "/root/openvpn/client-template.txt"
@@ -1075,21 +1068,15 @@ def replace_remote_line_in_text(text: str, new_host: str, new_port: str) -> str:
     replaced = False
     for line in text.splitlines():
         if line.strip().startswith("remote "):
-            # old: remote <host> <port>
             lines.append(f"remote {new_host} {new_port}")
             replaced = True
         else:
             lines.append(line)
     if not replaced:
-        # если не было remote — добавим в конец
         lines.append(f"remote {new_host} {new_port}")
     return "\n".join(lines) + "\n"
 
 def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
-    """
-    Обновляет client-template + все .ovpn: заменяет строку remote.
-    Возвращает статистику.
-    """
     stats = {"template_updated": 0, "ovpn_updated": 0, "errors": 0}
     tpl = find_client_template_path()
     if tpl:
@@ -1163,13 +1150,6 @@ async def process_remote_input(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Ошибок: {stats['errors']}",
         reply_markup=get_main_keyboard()
     )
-# ================== /UPDATE REMOTE ==================
-
-# ---------- Массовое удаление (Handlers) ----------
-# (оставлены без изменений кроме использования новых функций block/unblock где надо)
-# ... (ВСЕ handler'ы из предыдущей версии — без изменений, кроме того что они уже в твоём коде ниже) ...
-
-# (Полный набор handler'ов был у тебя — я оставляю их как были; изменения ниже касаются create/renew/expiry)
 
 # ---------- HELP ----------
 HELP_TEXT = """❓ Справка (обновлено: логические сроки)
@@ -1267,25 +1247,56 @@ HELP_TEXT = """❓ Справка (обновлено: логические ср
 Удачной работы!"""
 
 def build_help_messages():
-    # Экранируем все < > & чтобы не было BadRequest от Telegram
-    from html import escape
+    """
+    Делит HELP_TEXT на части, каждая часть — валидный законченный HTML:
+    <b>Помощь</b>
+    <pre>...</pre>
+    """
     raw = HELP_TEXT
-    esc = escape(raw)
-    wrapped = f"<b>Помощь</b>\n<pre>{esc}</pre>"
-    # Дробим на части по 3500 символов, чтобы не превышать лимит Telegram
+    esc = escape(raw)  # экранируем < > &
+    lines = esc.splitlines()
+
     parts = []
-    current = ""
-    for line in wrapped.splitlines():
-        if len(current) + len(line) + 1 > 3500:
-            parts.append(current)
-            current = ""
-        current += line + "\n"
-    if current:
-        parts.append(current)
+    block = []
+    current_len = 0
+    # Максимум ~3500 символов содержания внутри <pre>, чтобы уложиться в лимиты (4096 с запасом)
+    # Учтём служебный оверхед тегов (<b>...</b>\n<pre></pre>)
+    LIMIT = 3500
+
+    for line in lines:
+        line_len = len(line) + 1  # +\n
+        # Если добавление строки превысит лимит — завершаем текущий блок
+        if block and current_len + line_len > LIMIT:
+            content = "\n".join(block)
+            parts.append(f"<b>Помощь</b>\n<pre>{content}</pre>")
+            block = [line]
+            current_len = line_len
+        else:
+            block.append(line)
+            current_len += line_len
+
+    if block:
+        content = "\n".join(block)
+        parts.append(f"<b>Помощь</b>\n<pre>{content}</pre>")
+
     return parts
 
-# ---------- MAIN KEYBOARD ----------
+# NEW: отправка помощи (чтобы избежать 'Message is not modified')
+async def send_help_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    parts = build_help_messages()
+    # Первое сообщение с клавиатурой
+    await context.bot.send_message(chat_id=chat_id,
+                                   text=parts[0],
+                                   parse_mode="HTML",
+                                   reply_markup=get_main_keyboard())
+    # Остальные (если есть)
+    for p in parts[1:]:
+        await context.bot.send_message(chat_id=chat_id,
+                                       text=p,
+                                       parse_mode="HTML",
+                                       reply_markup=get_main_keyboard())
 
+# ---------- MAIN KEYBOARD ----------
 def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
@@ -1379,7 +1390,7 @@ def generate_ovpn_for_client(
         f.write(content)
     return ovpn_file
 
-# ---------- Создание ключа (добавлена логическая дата) ----------
+# ---------- Создание ключа ----------
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('await_key_name'):
         key_name = update.message.text.strip()
@@ -1402,7 +1413,6 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['await_key_expiry'] = False
         key_name = context.user_data['new_key_name']
         try:
-            # Реальный сертификат можно сделать длинным (например 3650), но оставим days чтобы не менять твою логику:
             subprocess.run(
                 f"EASYRSA_CERT_EXPIRE=3650 {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
                 shell=True, check=True, cwd=EASYRSA_DIR
@@ -1491,7 +1501,6 @@ async def renew_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Продление отменено.", reply_markup=get_main_keyboard())
 
 async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Поддержка старых callback типа renew_<name>
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
         await q.answer("Нет доступа", show_alert=True)
@@ -1801,11 +1810,9 @@ async def check_new_connections(app: Application):
             clients, online_names, tunnel_ips = parse_openvpn_status()
             update_traffic_from_status(clients)
 
-            # Энфорсер
             now_t = time.time()
             if now_t - check_new_connections._last_enforce > ENFORCE_INTERVAL_SECONDS:
                 enforce_client_expiries()
-                # Предупреждения за 1 день
                 check_and_notify_expiring(app.bot)
                 check_new_connections._last_enforce = now_t
 
@@ -1922,21 +1929,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    parts = build_help_messages()
-    await update.message.reply_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-    for p in parts[1:]:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=p,
-                                       parse_mode="HTML", reply_markup=get_main_keyboard())
-    # Остальные (если есть)
-    for p in parts[1:]:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=p, parse_mode="HTML", reply_markup=get_main_keyboard())
+    await send_help_messages(context, update.effective_chat.id)
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text(format_clients_by_certs(), parse_mode="HTML", reply_markup=get_main_keyboard())
 
-# --- ОБНОВЛЁННЫЙ просмотр сроков (логические сроки) ---
 async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = get_ovpn_files()
     names = sorted([f[:-5] for f in files])
@@ -1984,18 +1983,6 @@ async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
 
 # ---------- BUTTON HANDLER ----------
-# (Используем существующую реализацию — обновлены только точки вызова renewed/view_keys_expiry_handler)
-
-# ====== ВСТАВКА ВСЕХ ТВОИХ HANDLER'ОВ ИЗ ЧАСТЕЙ 2/5, 3/5, 4/5 (bulk_* и т.п.) =====
-# Я оставляю их без изменений, кроме того, что они уже присутствовали ранее.
-# Ниже вставлены полностью из исходной версии пользователя (с небольшой правкой текста в renew / expiry уже сделано выше).
-
-# ---------- Массовое удаление / отправка / enable / disable (Handlers из твоих частей) ----------
-# (Повторно НЕ вставляю здесь весь код из частей 2/5, так как он уже находится выше в объединённом файле.
-#  ПРИМЕЧАНИЕ: Если вставляешь этот файл как есть — весь функционал сохранён.)
-
-# Для компактности: ниже идёт твой оригинальный button_handler с минимальными коррекциями.
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
@@ -2003,6 +1990,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
     data = q.data
+    print("DEBUG callback_data:", data)
 
     if data == 'refresh':
         await q.edit_message_text(format_clients_by_certs(), parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -2046,7 +2034,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('await_remote_input', None)
         await q.edit_message_text("Отменено.", reply_markup=get_main_keyboard())
 
-    # Renew (логический)
+    # Renew
     elif data == 'renew_key':
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
@@ -2057,6 +2045,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Backup / Restore
     elif data == 'backup_menu':
         await backup_menu(update, context)
+    elif data == 'restore_menu':
+        await restore_menu(update, context)
     elif data == 'backup_create':
         await perform_backup_and_send(update, context)
     elif data == 'backup_list':
@@ -2142,15 +2132,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'help':
-        parts = build_help_messages()
-        try:
-            await q.edit_message_text(parts[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-        except Exception:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=parts[0],
-                                           parse_mode="HTML", reply_markup=get_main_keyboard())
-        for p in parts[1:]:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=p,
-                                           parse_mode="HTML", reply_markup=get_main_keyboard())
+        await send_help_messages(context, q.message.chat_id)
 
     elif data == 'log':
         await log_request(update, context)
@@ -2230,7 +2212,6 @@ def main():
     load_traffic_db()
     load_client_meta()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
@@ -2241,10 +2222,7 @@ def main():
     app.add_handler(CommandHandler("backup_restore", cmd_backup_restore))
     app.add_handler(CommandHandler("backup_restore_apply", cmd_backup_restore_apply))
 
-    # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
-
-    # Callback
     app.add_handler(CallbackQueryHandler(button_handler))
 
     import asyncio
