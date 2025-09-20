@@ -112,6 +112,8 @@ EXCLUDE_TEMP_DIR = "/root/monitor_bot/.excluded_root_archives"
 
 # Пагинация (если будет нужно)
 PAGE_SIZE_KEYS = 40
+# --- Управление показом главного меню ---
+MENU_ACTIVE = False  # Меню скрыто до первого /start
 
 # ---------- Логические сроки ----------
 def load_client_meta():
@@ -1298,6 +1300,9 @@ async def send_help_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 # ---------- MAIN KEYBOARD ----------
 def get_main_keyboard():
+    # Показываем главное меню только если оно активно
+    if not MENU_ACTIVE:
+        return None
     keyboard = [
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
@@ -1317,8 +1322,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup_menu'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help'),
-         InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1924,11 +1928,15 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+    global MENU_ACTIVE
+    MENU_ACTIVE = True
     await update.message.reply_text(f"Добро пожаловать! Версия: {BOT_VERSION}", reply_markup=get_main_keyboard())
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+    global MENU_ACTIVE
+    MENU_ACTIVE = False
     await send_help_messages(context, update.effective_chat.id)
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1991,6 +1999,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
     print("DEBUG callback_data:", data)
+
+    # Любой выбор пункта скрывает главное меню до следующего /start
+    global MENU_ACTIVE
+    MENU_ACTIVE = False
 
     if data == 'refresh':
         await q.edit_message_text(format_clients_by_certs(), parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -2142,7 +2154,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['await_key_name'] = True
 
     elif data == 'home':
-        await q.edit_message_text("Главное меню.", reply_markup=get_main_keyboard())
+        # Теперь 'home' просто подсказка; меню возвращается только через /start
+        await q.edit_message_text("Меню скрыто. Для показа снова введите /start")
     else:
         await q.edit_message_text("Неизвестная команда.", reply_markup=get_main_keyboard())
 
